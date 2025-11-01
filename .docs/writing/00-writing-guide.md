@@ -10,7 +10,7 @@
 
 ## 어떻게 쓰면 좋을까?
 
-```md
+```markdown
 ## 문제 관측/발견/정의
 
 ## 다양한 시도
@@ -73,7 +73,7 @@
 
 예:
 
-```kt
+```kotlin
 // before
 val userRepo = mock<UserRepository>()
 whenever(userRepo.findById(1L)).thenReturn(User(...))
