@@ -172,6 +172,169 @@ fun notifyExternalSystem(order: Order) {
 
 처음엔 불안했다. "이게 맞나? 데이터가 틀어지면 어쩌지?" 하지만 카프카 같은 메시지 큐나, 재시도 큐를 잘 설계하면 충분히 관리 가능하다는 걸 알게 됐다.
 
+## Bounded Context, 경계를 명확히 하다
+
+### 또 다른 설계 문제
+
+시퀀스 다이어그램을 그리면서 뭔가 이상한 걸 발견했다.
+
+```kotlin
+// ProductService (상품 BC)
+class ProductService {
+    fun getProducts(...): List<Product> {
+        val products = productRepository.findAll()
+        products.forEach { product ->
+            val likeCount = likeRepository.countByProductId(product.id)  // ???
+        }
+    }
+}
+```
+
+상품 서비스가 좋아요 Repository를 직접 사용하고 있었다. 언뜻 보면 문제없어 보인다. 상품 목록에 좋아요 수를 보여줘야 하니까.
+
+근데 한편으론 이랬다:
+
+```kotlin
+// LikeService (좋아요 BC)
+class LikeService {
+    fun addLike(userId: Long, productId: Long) {
+        val product = productReader.getById(productId)  // 이건 괜찮은데?
+        // ...
+    }
+}
+```
+
+좋아요 서비스는 `ProductReader`라는 인터페이스를 통해 상품 정보에 접근한다. 근데 상품 서비스는 `LikeRepository`를 직접 쓴다? 뭔가 일관성이 없었다.
+
+### DDD의 Bounded Context
+
+찾아보니 이건 **Bounded Context**를 제대로 분리하지 않은 거였다.
+
+DDD(Domain-Driven Design)에서는 각 도메인이 명확한 경계를 가져야 한다고 한다. 그리고 도메인 간 협력은 **공개 인터페이스**를 통해서만 이뤄져야 한다.
+
+현재 설계의 문제:
+- ✅ LikeService → ProductReader: 공개 인터페이스 사용 (올바름)
+- ❌ ProductService → LikeRepository: 내부 구현 직접 접근 (잘못됨)
+
+Product BC가 Like BC의 내부 구현(Repository)에 직접 접근하면:
+- Like BC의 내부 구조를 변경하기 어려움
+- Product BC가 Like BC에 강하게 결합됨
+- 테스트하기 어려움 (Like BC 전체를 띄워야 함)
+
+### Facade 패턴으로 해결
+
+해결 방법은 **Facade 인터페이스**였다. 각 BC는 외부에 공개할 기능을 Facade로 제공한다.
+
+```kotlin
+// Like BC의 공개 인터페이스
+interface LikeFacade {
+    fun countByProductId(productId: Long): Long
+    fun existsByUserIdAndProductId(userId: Long, productId: Long): Boolean
+}
+
+// Product BC의 공개 인터페이스
+interface ProductFacade {
+    fun getById(productId: Long): Product
+    fun checkStock(productId: Long, quantity: Int): Boolean
+    fun decreaseStock(productId: Long, quantity: Int)
+}
+```
+
+이제 BC 간 협력이 명확해진다:
+
+```kotlin
+// ProductService
+class ProductService(
+    private val likeFacade: LikeFacade  // Repository가 아닌 Facade 의존
+) {
+    fun getProducts(...): List<Product> {
+        val products = productRepository.findAll()
+        products.forEach { product ->
+            val likeCount = likeFacade.countByProductId(product.id)
+        }
+    }
+}
+
+// LikeService
+class LikeService(
+    private val productFacade: ProductFacade  // Reader를 Facade로 통일
+) {
+    fun addLike(userId: Long, productId: Long) {
+        val product = productFacade.getById(productId)
+        // ...
+    }
+}
+```
+
+### 주문에서도 마찬가지
+
+주문 생성에서도 같은 원칙을 적용했다.
+
+처음 설계:
+```kotlin
+class OrderService(
+    private val productReader: ProductReader,
+    private val stockService: StockService,  // Stock BC를 별도로?
+    private val pointService: PointService   // Point BC
+) {
+    // ...
+}
+```
+
+근데 Stock은 Product의 일부 아닌가? Stock을 별도 BC로 분리하면 Product와 Stock이 각자의 트랜잭션을 가지게 되어 정합성 문제가 생길 수 있다.
+
+수정 후:
+```kotlin
+class OrderService(
+    private val productFacade: ProductFacade,  // 재고 관리도 Product BC에 포함
+    private val pointFacade: PointFacade
+) {
+    @Transactional
+    fun createOrder(...) {
+        // 상품 조회
+        val product = productFacade.getById(productId)
+
+        // 재고 차감 (Product BC 내부에서 처리)
+        productFacade.decreaseStock(productId, quantity)
+
+        // 포인트 차감 (Point BC에서 처리)
+        pointFacade.deductPoints(userId, amount)
+    }
+}
+```
+
+**Stock은 Product BC의 일부**로 봤다. Product와 Stock은 항상 함께 움직여야 하고, 같은 트랜잭션 안에서 관리되어야 한다. 따라서 `ProductFacade`가 재고 관련 기능도 함께 제공한다.
+
+### BC 정리
+
+최종적으로 6개의 Bounded Context로 정리했다:
+
+1. **User BC**: 사용자 관리
+2. **Brand BC**: 브랜드 관리
+3. **Product BC**: 상품 및 재고 관리 (Stock 포함)
+4. **Like BC**: 좋아요 관리
+5. **Order BC**: 주문 관리
+6. **Point BC**: 포인트 관리
+
+BC 간 협력:
+- Product ↔ Like: 양방향 (Facade를 통해)
+- Order → Product: 단방향 (재고 차감)
+- Order → Point: 단방향 (포인트 차감)
+
+### 배운 것
+
+**경계를 명확히 하는 게 중요하다.**
+
+처음엔 "그냥 필요한 Repository 갖다 쓰면 되는 거 아냐?"라고 생각했다. 하지만 그러면 도메인 간 결합도가 높아지고, 나중에 수정하기 어려워진다.
+
+Facade 인터페이스로 경계를 명확히 하니:
+- 각 BC가 무엇을 공개하는지 명확함
+- BC 내부 구현을 자유롭게 변경 가능
+- 테스트하기 쉬움 (Facade를 Mock으로 대체)
+- 코드를 읽는 사람이 BC 간 관계를 쉽게 이해
+
+"좋은 설계는 경계가 명확한 설계"라는 말이 이해가 됐다.
+
 ## 도메인 객체가 똑똑해야 하는 이유
 
 ### Service가 너무 똑똑했던 문제
@@ -298,9 +461,11 @@ class OrderService {
 이번 설계 과정에서 가장 많이 했던 질문은 "왜?"였다.
 
 - 왜 멱등성이 필요한가?
-- 왜 낙관적 락인가?
+- 왜 비관적 락을 선택했는가?
 - 왜 외부 연동은 트랜잭션 밖인가?
 - 왜 도메인 객체에 로직을 넣는가?
+- 왜 Bounded Context를 분리해야 하는가?
+- 왜 Facade 인터페이스가 필요한가?
 
 정답이 있는 질문은 하나도 없었다. 대신 **"이 상황에서는 이게 더 나은 선택 같다"**는 판단을 계속했다.
 
@@ -312,11 +477,13 @@ class OrderService {
 
 1. **N+1 문제를 실제로 겪어보고 해결해보고 싶다.** 지금은 이론만 알고 실제로 얼마나 느린지 체감하지 못했다.
 
-2. **동시성 테스트를 작성해보고 싶다.** 낙관적 락이 정말 동작하는지, 어떻게 테스트로 검증할 수 있을까?
+2. **동시성 테스트를 작성해보고 싶다.** 비관적 락이 정말 동작하는지, 어떻게 테스트로 검증할 수 있을까?
 
 3. **외부 시스템 연동 실패를 재시도하는 로직**을 구현해보고 싶다. 지금은 설계만 했지 실제 코드는 없다.
 
 4. **이벤트 기반 아키텍처**를 적용해보면 어떨까? 주문 생성 후 이벤트를 발행하고, 리스너가 외부 시스템 연동을 처리하는 방식.
+
+5. **Facade 구현을 실제로 해보고 싶다.** 설계는 했지만 실제 코드로 어떻게 구현할지, 트랜잭션 경계는 어떻게 관리할지 궁금하다.
 
 이번 라운드는 "구현"보다 "고민"이 많았던 시간이었다. ERD 한 장, 시퀀스 다이어그램 몇 개 그리는 데 한참이 걸렸다. 하지만 그만큼 "왜?"를 생각하는 시간이었고, 설계가 단순히 "어떻게"가 아니라는 걸 배웠다.
 
