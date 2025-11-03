@@ -1,6 +1,6 @@
 # Round2 - 이커머스 설계하며 마주한 질문들
 
-**TL;DR**: 이커머스 시스템을 설계하면서 "좋아요를 두 번 누르면?", "재고가 음수가 되면?", "주문 실패는 어디까지 롤백해야 해?"라는 질문들과 씨름했다. 정답을 찾기보다는, 왜 그런 선택을 했는지 고민의 과정을 기록한 글이다.
+**TL;DR**: 이커머스 시스템을 설계하면서 "좋아요를 두 번 누르면?", "재고가 음수가 되면?", "주문 실패는 어디까지 롤백해야 해?", "도메인 간 경계는 어떻게 나눌까?"라는 질문들과 씨름했다. 정답을 찾기보다는, 왜 그런 선택을 했는지 고민의 과정을 기록한 글이다.
 
 ## 설계를 시작하며
 
@@ -176,162 +176,66 @@ fun notifyExternalSystem(order: Order) {
 
 ### 또 다른 설계 문제
 
-시퀀스 다이어그램을 그리면서 뭔가 이상한 걸 발견했다.
+시퀀스 다이어그램을 그리면서 뭔가 이상한 걸 발견했다. 상품 서비스가 좋아요 Repository를 **직접** 사용하고 있었다.
 
 ```kotlin
-// ProductService (상품 BC)
-class ProductService {
-    fun getProducts(...): List<Product> {
-        val products = productRepository.findAll()
-        products.forEach { product ->
-            val likeCount = likeRepository.countByProductId(product.id)  // ???
-        }
-    }
-}
+ProductService → likeRepository.countByProductId()  // 내부 구현 직접 접근
 ```
 
-상품 서비스가 좋아요 Repository를 직접 사용하고 있었다. 언뜻 보면 문제없어 보인다. 상품 목록에 좋아요 수를 보여줘야 하니까.
-
-근데 한편으론 이랬다:
+반면 좋아요 서비스는 상품 정보를 가져올 때 인터페이스를 썼다:
 
 ```kotlin
-// LikeService (좋아요 BC)
-class LikeService {
-    fun addLike(userId: Long, productId: Long) {
-        val product = productReader.getById(productId)  // 이건 괜찮은데?
-        // ...
-    }
-}
+LikeService → productReader.getById()  // 인터페이스 사용
 ```
 
-좋아요 서비스는 `ProductReader`라는 인터페이스를 통해 상품 정보에 접근한다. 근데 상품 서비스는 `LikeRepository`를 직접 쓴다? 뭔가 일관성이 없었다.
-
-### DDD의 Bounded Context
-
-찾아보니 이건 **Bounded Context**를 제대로 분리하지 않은 거였다.
-
-DDD(Domain-Driven Design)에서는 각 도메인이 명확한 경계를 가져야 한다고 한다. 그리고 도메인 간 협력은 **공개 인터페이스**를 통해서만 이뤄져야 한다.
-
-현재 설계의 문제:
-- ✅ LikeService → ProductReader: 공개 인터페이스 사용 (올바름)
-- ❌ ProductService → LikeRepository: 내부 구현 직접 접근 (잘못됨)
-
-Product BC가 Like BC의 내부 구현(Repository)에 직접 접근하면:
-- Like BC의 내부 구조를 변경하기 어려움
-- Product BC가 Like BC에 강하게 결합됨
-- 테스트하기 어려움 (Like BC 전체를 띄워야 함)
+일관성이 없었다. 찾아보니 이건 **Bounded Context**를 제대로 분리하지 않은 거였다.
 
 ### Facade 패턴으로 해결
 
-해결 방법은 **Facade 인터페이스**였다. 각 BC는 외부에 공개할 기능을 Facade로 제공한다.
+DDD에서는 각 도메인이 명확한 경계를 가져야 한다. 도메인 간 협력은 **공개 인터페이스**를 통해서만 이뤄져야 한다.
+
+해결 방법은 **Facade 인터페이스**였다. 각 BC는 외부에 공개할 기능만 Facade로 제공한다:
 
 ```kotlin
-// Like BC의 공개 인터페이스
 interface LikeFacade {
     fun countByProductId(productId: Long): Long
-    fun existsByUserIdAndProductId(userId: Long, productId: Long): Boolean
 }
 
-// Product BC의 공개 인터페이스
 interface ProductFacade {
     fun getById(productId: Long): Product
-    fun checkStock(productId: Long, quantity: Int): Boolean
-    fun decreaseStock(productId: Long, quantity: Int)
+    fun decreaseStock(productId: Long, quantity: Int)  // 재고도 Product BC 일부
 }
 ```
 
 이제 BC 간 협력이 명확해진다:
 
 ```kotlin
-// ProductService
-class ProductService(
-    private val likeFacade: LikeFacade  // Repository가 아닌 Facade 의존
-) {
-    fun getProducts(...): List<Product> {
-        val products = productRepository.findAll()
-        products.forEach { product ->
-            val likeCount = likeFacade.countByProductId(product.id)
-        }
-    }
-}
+// Product BC
+ProductService(likeFacade: LikeFacade)  // ✅ Facade 사용
 
-// LikeService
-class LikeService(
-    private val productFacade: ProductFacade  // Reader를 Facade로 통일
-) {
-    fun addLike(userId: Long, productId: Long) {
-        val product = productFacade.getById(productId)
-        // ...
-    }
-}
+// Like BC
+LikeService(productFacade: ProductFacade)  // ✅ Facade 사용
+
+// Order BC
+OrderService(
+    productFacade: ProductFacade,  // 상품 + 재고
+    pointFacade: PointFacade       // 포인트
+)
 ```
 
-### 주문에서도 마찬가지
+중요한 결정: **Stock을 별도 BC로 분리하지 않고 Product BC의 일부로** 봤다. Product와 Stock은 항상 함께 움직이고 같은 트랜잭션에서 관리되어야 하니까.
 
-주문 생성에서도 같은 원칙을 적용했다.
-
-처음 설계:
-```kotlin
-class OrderService(
-    private val productReader: ProductReader,
-    private val stockService: StockService,  // Stock BC를 별도로?
-    private val pointService: PointService   // Point BC
-) {
-    // ...
-}
-```
-
-근데 Stock은 Product의 일부 아닌가? Stock을 별도 BC로 분리하면 Product와 Stock이 각자의 트랜잭션을 가지게 되어 정합성 문제가 생길 수 있다.
-
-수정 후:
-```kotlin
-class OrderService(
-    private val productFacade: ProductFacade,  // 재고 관리도 Product BC에 포함
-    private val pointFacade: PointFacade
-) {
-    @Transactional
-    fun createOrder(...) {
-        // 상품 조회
-        val product = productFacade.getById(productId)
-
-        // 재고 차감 (Product BC 내부에서 처리)
-        productFacade.decreaseStock(productId, quantity)
-
-        // 포인트 차감 (Point BC에서 처리)
-        pointFacade.deductPoints(userId, amount)
-    }
-}
-```
-
-**Stock은 Product BC의 일부**로 봤다. Product와 Stock은 항상 함께 움직여야 하고, 같은 트랜잭션 안에서 관리되어야 한다. 따라서 `ProductFacade`가 재고 관련 기능도 함께 제공한다.
-
-### BC 정리
-
-최종적으로 6개의 Bounded Context로 정리했다:
-
-1. **User BC**: 사용자 관리
-2. **Brand BC**: 브랜드 관리
-3. **Product BC**: 상품 및 재고 관리 (Stock 포함)
-4. **Like BC**: 좋아요 관리
-5. **Order BC**: 주문 관리
-6. **Point BC**: 포인트 관리
-
-BC 간 협력:
-- Product ↔ Like: 양방향 (Facade를 통해)
-- Order → Product: 단방향 (재고 차감)
-- Order → Point: 단방향 (포인트 차감)
+최종적으로 6개의 BC로 정리:
+- **User BC**, **Brand BC**, **Product BC**(재고 포함), **Like BC**, **Order BC**, **Point BC**
 
 ### 배운 것
 
-**경계를 명확히 하는 게 중요하다.**
-
 처음엔 "그냥 필요한 Repository 갖다 쓰면 되는 거 아냐?"라고 생각했다. 하지만 그러면 도메인 간 결합도가 높아지고, 나중에 수정하기 어려워진다.
 
-Facade 인터페이스로 경계를 명확히 하니:
-- 각 BC가 무엇을 공개하는지 명확함
+Facade로 경계를 명확히 하니:
 - BC 내부 구현을 자유롭게 변경 가능
 - 테스트하기 쉬움 (Facade를 Mock으로 대체)
-- 코드를 읽는 사람이 BC 간 관계를 쉽게 이해
+- BC 간 관계를 쉽게 이해
 
 "좋은 설계는 경계가 명확한 설계"라는 말이 이해가 됐다.
 
