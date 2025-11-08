@@ -1,12 +1,25 @@
 # 클래스 다이어그램 & 도메인 모델
 
-이커머스 시스템의 도메인 객체와 그들 간의 관계를 정의
+이커머스 시스템의 도메인 객체와 그들 간의 관계를 레이어드 아키텍처 관점에서 정의
+
+## 도메인 모델링 개요
+
+### Entity vs Value Object
+
+- **Entity**: 고유 식별자를 가지며, 생명주기가 독립적인 객체 (동일성은 ID로 판단)
+- **Value Object (VO)**: 식별자 없이 값으로만 구분되는 불변 객체 (동일성은 값으로 판단)
+
+### Repository Interface 위치
+
+- **Repository Interface는 Domain Layer에 위치**: 도메인이 필요로 하는 영속성 계약 정의
+- **Repository 구현체는 Infrastructure Layer에 위치**: JPA 등 구체 기술로 구현
 
 ## 전체 도메인 모델
 
 ```mermaid
 classDiagram
     class User {
+        <<Entity>>
         +Long id
         +String name
         +String email
@@ -16,24 +29,25 @@ classDiagram
     }
 
     class Brand {
+        <<Entity>>
         +Long id
         +String name
         +String description
         +LocalDateTime createdAt
-        +getProducts() List~Product~
     }
 
     class Product {
+        <<Entity>>
         +Long id
         +String name
         +Price price
         +Brand brand
-        +Stock stock
         +LocalDateTime createdAt
         +checkStockAvailable(quantity) boolean
     }
 
     class Price {
+        <<Value Object>>
         +BigDecimal amount
         +Currency currency
         +add(Price) Price
@@ -42,6 +56,7 @@ classDiagram
     }
 
     class Stock {
+        <<Entity>>
         +Long productId
         +int quantity
         +decrease(int) void
@@ -50,26 +65,30 @@ classDiagram
     }
 
     class Like {
+        <<Entity>>
         +Long id
-        +User user
-        +Product product
+        +Long userId
+        +Long productId
         +LocalDateTime createdAt
     }
 
     class Order {
+        <<Entity, Aggregate Root>>
         +Long id
-        +User user
+        +Long userId
         +List~OrderItem~ items
         +Money totalAmount
         +OrderStatus status
         +LocalDateTime orderedAt
         +calculateTotalAmount() Money
+        +isOwnedBy(userId) boolean
         +cancel() void
     }
 
     class OrderItem {
+        <<Entity>>
         +Long id
-        +Product product
+        +Long productId
         +String productName
         +Long brandId
         +String brandName
@@ -80,6 +99,7 @@ classDiagram
     }
 
     class Money {
+        <<Value Object>>
         +BigDecimal amount
         +Currency currency
         +add(Money) Money
@@ -88,6 +108,7 @@ classDiagram
     }
 
     class Point {
+        <<Entity>>
         +Long userId
         +Money balance
         +LocalDateTime updatedAt
@@ -97,15 +118,17 @@ classDiagram
     }
 
     Brand "1" --> "*" Product : has
-    Product "1" --> "1" Price : has
+    Product "1" --> "1" Price : contains (VO)
     Product "1" --> "1" Stock : has
-    Like "1" --> "1" User : belongs to
-    Like "1" --> "1" Product : refers to
-    Order "1" --> "1" User : belongs to
-    Order "1" --> "*" OrderItem : contains
-    OrderItem "1" --> "1" Product : refers to
-    OrderItem "1" --> "1" Price : has
-    Point "1" --> "1" User : belongs to
+    Order "1" *-- "*" OrderItem : aggregates
+    OrderItem "1" --> "1" Price : contains (VO)
+    OrderItem "1" --> "1" Money : uses (VO)
+    Order "1" --> "1" Money : contains (VO)
+    Point "1" --> "1" Money : contains (VO)
+
+    note for Order "Aggregate Root: OrderItem은 Order를 통해서만 접근"
+    note for Price "Value Object: 불변, 식별자 없음"
+    note for Money "Value Object: 불변, 식별자 없음"
 ```
 
 ## 도메인 객체 상세 설명
@@ -163,8 +186,9 @@ classDiagram
   - Price를 VO로 포함
   - Stock과 1:1 관계
 
-### 4. Price (가격) - Value Object
+### 4. Price (가격) - **Value Object**
 
+- **타입**: Value Object (식별자 없음, 불변)
 - **책임**
   - 금액 표현 및 계산
   - 통화 단위 관리
@@ -176,9 +200,11 @@ classDiagram
   - `multiply(int)`: 가격 곱하기
   - `compareTo(Price)`: 가격 비교
 - **설계 포인트**
-  - Value Object (식별자 없음, 불변)
+  - **Value Object의 핵심**: 식별자가 없고, 값으로만 동일성을 판단
+  - **불변성**: 모든 연산은 새로운 Price 객체 반환
   - BigDecimal로 정확한 금액 계산
   - 통화 단위 포함하여 다국가 지원 가능
+  - **도메인 무결성**: `init` 블록에서 음수 방지 검증
 
 ### 5. Stock (재고)
 
@@ -261,8 +287,9 @@ classDiagram
   - Product와 N:1 관계
   - 주문 시점의 상품명, 브랜드 정보(ID, 이름, 설명), 가격을 스냅샷으로 저장 (상품/브랜드 정보 변경에 영향받지 않음)
 
-### 9. Money (금액) - Value Object
+### 9. Money (금액) - **Value Object**
 
+- **타입**: Value Object (식별자 없음, 불변)
 - **책임**
   - 금액 표현 및 계산
   - 통화 단위 관리
@@ -274,8 +301,11 @@ classDiagram
   - `subtract(Money)`: 금액 빼기
   - `multiply(int)`: 금액 곱하기
 - **설계 포인트**
-  - Value Object (식별자 없음, 불변)
+  - **Value Object의 핵심**: 식별자가 없고, 값으로만 동일성을 판단
+  - **불변성**: 모든 연산은 새로운 Money 객체 반환
   - Price와 유사하지만 더 넓은 범위에서 사용 (주문 총액, 포인트 등)
+  - **도메인 무결성**: `init` 블록에서 음수 방지 검증
+  - **Kotlin의 inline value class** 사용 가능 (`@JvmInline value class`)
 
 ### 10. Point (포인트)
 
@@ -471,119 +501,299 @@ stateDiagram-v2
 4. **최종 상태**
    - DELIVERED, CANCELLED은 최종 상태로 더 이상 변경 불가
 
-## Facade 인터페이스 설계
+## Repository Interface 설계 (Domain Layer)
 
-Bounded Context 간 협력을 위한 공개 인터페이스입니다.
+Repository Interface는 **Domain Layer에 위치**하여 도메인이 필요로 하는 영속성 계약을 정의합니다.
+구체적인 구현은 **Infrastructure Layer**에서 JPA 등의 기술로 제공됩니다.
 
-### ProductFacade
-
-Product BC의 공개 인터페이스로, 다른 BC가 상품 및 재고 관련 기능에 접근할 때 사용합니다.
+### ProductRepository
 
 ```kotlin
-interface ProductFacade {
-    // 상품 조회
-    fun getById(productId: Long): Product
+// Domain Layer: domain/product/ProductRepository.kt
+interface ProductRepository {
+    fun findById(productId: Long): Product?
+    fun findAll(brandId: Long?, sort: String, pageable: Pageable): Page<Product>
     fun existsById(productId: Long): Boolean
+    fun save(product: Product): Product
+}
 
-    // 재고 관리 (Stock은 Product BC의 일부)
-    fun checkStock(productId: Long, quantity: Int): Boolean
-    fun decreaseStock(productId: Long, quantity: Int)  // 비관적 락 사용
-    fun increaseStock(productId: Long, quantity: Int)
+// Infrastructure Layer: infrastructure/product/ProductRepositoryImpl.kt
+@Repository
+class ProductRepositoryImpl(
+    private val jpaRepository: ProductJpaRepository
+) : ProductRepository {
+    override fun findById(productId: Long): Product? =
+        jpaRepository.findById(productId).orElse(null)?.toDomain()
+    // ... JPA 기반 구현
 }
 ```
 
-- **사용처**: LikeService (상품 존재 확인), OrderService (상품 조회 및 재고 관리)
-- **구현**: ProductFacadeImpl (ProductService와 StockService를 내부적으로 사용)
-- **동시성 제어**:
-  - `checkStock()`: 트랜잭션 전 빠른 검증 (락 없음)
-  - `decreaseStock()`: 트랜잭션 내에서 비관적 락으로 재고 확인 및 차감을 원자적으로 수행
-  - TOCTOU 갭은 decreaseStock의 비관적 락으로 해결
-
-### LikeFacade
-
-Like BC의 공개 인터페이스로, 다른 BC가 좋아요 정보에 접근할 때 사용합니다.
+### StockRepository
 
 ```kotlin
-interface LikeFacade {
-    // 좋아요 수 조회
-    fun countByProductId(productId: Long): Long
-    fun countByUserId(userId: Long): Long
+// Domain Layer: domain/product/StockRepository.kt
+interface StockRepository {
+    fun findByProductId(productId: Long): Stock?
+    fun findByProductIdWithLock(productId: Long): Stock?  // 비관적 락
+    fun save(stock: Stock): Stock
+}
 
-    // 좋아요 여부 확인
+// Infrastructure Layer: infrastructure/product/StockRepositoryImpl.kt
+@Repository
+class StockRepositoryImpl(
+    private val jpaRepository: StockJpaRepository
+) : StockRepository {
+    override fun findByProductIdWithLock(productId: Long): Stock? =
+        jpaRepository.findByProductIdWithLock(productId)?.toDomain()
+    // ... JPA + SELECT FOR UPDATE 구현
+}
+```
+
+### LikeRepository
+
+```kotlin
+// Domain Layer: domain/like/LikeRepository.kt
+interface LikeRepository {
     fun existsByUserIdAndProductId(userId: Long, productId: Long): Boolean
+    fun countByProductId(productId: Long): Long
+    fun save(like: Like): Like
+    fun deleteByUserIdAndProductId(userId: Long, productId: Long)
 }
 ```
 
-- **사용처**: ProductService (좋아요 수 집계)
-- **구현**: LikeFacadeImpl (LikeRepository를 내부적으로 사용)
-
-### PointFacade
-
-Point BC의 공개 인터페이스로, 다른 BC가 포인트 관련 기능에 접근할 때 사용합니다.
+### OrderRepository
 
 ```kotlin
-interface PointFacade {
-    // 포인트 조회
-    fun getBalance(userId: Long): Money
-
-    // 포인트 확인 및 차감
-    fun checkBalance(userId: Long, amount: Money): Boolean
-    fun deductPoints(userId: Long, amount: Money)
-    fun chargePoints(userId: Long, amount: Money)
+// Domain Layer: domain/order/OrderRepository.kt
+interface OrderRepository {
+    fun findById(orderId: Long): Order?
+    fun findByUserId(userId: Long, pageable: Pageable): Page<Order>
+    fun save(order: Order): Order
 }
 ```
 
-- **사용처**: OrderService (포인트 확인 및 차감)
-- **구현**: PointFacadeImpl (PointService를 내부적으로 사용)
+### PointRepository
 
-## 패키지 구조
+```kotlin
+// Domain Layer: domain/point/PointRepository.kt
+interface PointRepository {
+    fun findByUserId(userId: Long): Point?
+    fun findByUserIdWithLock(userId: Long): Point?  // 비관적 락
+    fun save(point: Point): Point
+}
+```
+
+## Domain Service 설계
+
+Domain Service는 여러 도메인 객체의 협력이 필요한 로직을 처리합니다.
+
+### OrderService
+
+```kotlin
+// Domain Layer: domain/order/OrderService.kt
+class OrderService(
+    private val orderRepository: OrderRepository,
+    private val productRepository: ProductRepository,
+    private val stockRepository: StockRepository,
+    private val pointRepository: PointRepository
+) {
+    fun createOrder(userId: Long, orderItems: List<OrderItemRequest>): Order {
+        // 1. 상품 존재 및 재고 사전 검증
+        val products = orderItems.map { item ->
+            productRepository.findById(item.productId)
+                ?: throw ProductNotFoundException(item.productId)
+        }
+
+        orderItems.forEach { item ->
+            val stock = stockRepository.findByProductId(item.productId)
+                ?: throw StockNotFoundException(item.productId)
+            if (!stock.isAvailable(item.quantity)) {
+                throw InsufficientStockException(item.productId, item.quantity)
+            }
+        }
+
+        // 2. 총액 계산
+        val totalAmount = calculateTotalAmount(products, orderItems)
+
+        // 3. 포인트 검증
+        val point = pointRepository.findByUserId(userId)
+            ?: throw PointNotFoundException(userId)
+        if (!point.canDeduct(totalAmount)) {
+            throw InsufficientPointException(userId, totalAmount)
+        }
+
+        // 4. Order 생성 및 저장
+        val order = Order.create(userId, orderItems, totalAmount)
+        orderRepository.save(order)
+
+        // 5. 재고 차감 (비관적 락)
+        orderItems.forEach { item ->
+            val stock = stockRepository.findByProductIdWithLock(item.productId)!!
+            stock.decrease(item.quantity)
+            stockRepository.save(stock)
+        }
+
+        // 6. 포인트 차감 (비관적 락)
+        val lockedPoint = pointRepository.findByUserIdWithLock(userId)!!
+        lockedPoint.deduct(totalAmount)
+        pointRepository.save(lockedPoint)
+
+        return order
+    }
+}
+```
+
+### ProductQueryService
+
+```kotlin
+// Domain Layer: domain/product/ProductQueryService.kt
+class ProductQueryService(
+    private val productRepository: ProductRepository,
+    private val likeRepository: LikeRepository
+) {
+    fun findProducts(brandId: Long?, sort: String, pageable: Pageable): List<ProductWithLikeCount> {
+        val products = productRepository.findAll(brandId, sort, pageable)
+
+        return products.map { product ->
+            val likeCount = likeRepository.countByProductId(product.id)
+            ProductWithLikeCount(product, likeCount)
+        }
+    }
+}
+```
+
+### LikeService
+
+```kotlin
+// Domain Layer: domain/like/LikeService.kt
+class LikeService(
+    private val likeRepository: LikeRepository,
+    private val productRepository: ProductRepository
+) {
+    fun addLike(userId: Long, productId: Long) {
+        // 상품 존재 확인
+        if (!productRepository.existsById(productId)) {
+            throw ProductNotFoundException(productId)
+        }
+
+        // 멱등성: 이미 존재하면 저장하지 않음
+        if (likeRepository.existsByUserIdAndProductId(userId, productId)) {
+            return
+        }
+
+        val like = Like(userId = userId, productId = productId)
+        likeRepository.save(like)
+    }
+
+    fun removeLike(userId: Long, productId: Long) {
+        // 상품 존재 확인
+        if (!productRepository.existsById(productId)) {
+            throw ProductNotFoundException(productId)
+        }
+
+        // 멱등성: 없어도 성공
+        likeRepository.deleteByUserIdAndProductId(userId, productId)
+    }
+}
+```
+
+## 패키지 구조 (레이어드 아키텍처)
 
 ```txt
-domain/
-├── user/
-│   ├── User.kt
-│   └── Gender.kt
-├── brand/
-│   └── Brand.kt
-├── product/
-│   ├── Product.kt
-│   ├── Price.kt
-│   ├── Stock.kt
-│   ├── Currency.kt
-│   └── ProductFacade.kt          # 공개 인터페이스
-├── like/
-│   ├── Like.kt
-│   └── LikeFacade.kt              # 공개 인터페이스
-├── order/
-│   ├── Order.kt
-│   ├── OrderItem.kt
-│   ├── OrderStatus.kt
-│   └── Money.kt
-└── point/
-    ├── Point.kt
-    └── PointFacade.kt             # 공개 인터페이스
+src/main/kotlin/
+├── interfaces/               # Interfaces Layer
+│   ├── api/
+│   │   ├── product/
+│   │   │   ├── ProductController.kt
+│   │   │   ├── ProductRequest.kt
+│   │   │   └── ProductResponse.kt
+│   │   ├── like/
+│   │   │   └── LikeController.kt
+│   │   ├── order/
+│   │   │   └── OrderController.kt
+│   │   └── ...
+│
+├── application/              # Application Layer
+│   ├── product/
+│   │   └── ProductApplicationService.kt
+│   ├── like/
+│   │   └── LikeApplicationService.kt
+│   ├── order/
+│   │   └── OrderApplicationService.kt
+│   └── ...
+│
+├── domain/                   # Domain Layer (핵심)
+│   ├── user/
+│   │   ├── User.kt                    # Entity
+│   │   ├── Gender.kt                  # Enum
+│   │   └── UserRepository.kt          # Interface
+│   ├── brand/
+│   │   ├── Brand.kt                   # Entity
+│   │   └── BrandRepository.kt         # Interface
+│   ├── product/
+│   │   ├── Product.kt                 # Entity
+│   │   ├── Price.kt                   # Value Object
+│   │   ├── Stock.kt                   # Entity
+│   │   ├── Currency.kt                # Enum
+│   │   ├── ProductRepository.kt       # Interface
+│   │   ├── StockRepository.kt         # Interface
+│   │   └── ProductQueryService.kt     # Domain Service
+│   ├── like/
+│   │   ├── Like.kt                    # Entity
+│   │   ├── LikeRepository.kt          # Interface
+│   │   └── LikeService.kt             # Domain Service
+│   ├── order/
+│   │   ├── Order.kt                   # Entity (Aggregate Root)
+│   │   ├── OrderItem.kt               # Entity
+│   │   ├── OrderStatus.kt             # Enum
+│   │   ├── Money.kt                   # Value Object
+│   │   ├── OrderRepository.kt         # Interface
+│   │   └── OrderService.kt            # Domain Service
+│   └── point/
+│       ├── Point.kt                   # Entity
+│       └── PointRepository.kt         # Interface
+│
+└── infrastructure/           # Infrastructure Layer
+    ├── product/
+    │   ├── ProductRepositoryImpl.kt
+    │   ├── ProductJpaRepository.kt
+    │   ├── StockRepositoryImpl.kt
+    │   ├── StockJpaRepository.kt
+    │   ├── ProductEntity.kt
+    │   └── StockEntity.kt
+    ├── like/
+    │   ├── LikeRepositoryImpl.kt
+    │   ├── LikeJpaRepository.kt
+    │   └── LikeEntity.kt
+    ├── order/
+    │   ├── OrderRepositoryImpl.kt
+    │   ├── OrderJpaRepository.kt
+    │   ├── OrderEntity.kt
+    │   └── OrderItemEntity.kt
+    └── ...
 ```
 
-### Bounded Context 간 의존성
+### 레이어 간 의존성
 
 ```mermaid
-graph LR
-    ProductBC[Product BC]
-    LikeBC[Like BC]
-    OrderBC[Order BC]
-    PointBC[Point BC]
+graph TD
+    Interfaces[Interfaces Layer<br/>Controller, Request/Response DTO]
+    Application[Application Layer<br/>ApplicationService, 트랜잭션 경계]
+    Domain[Domain Layer<br/>Entity, VO, Domain Service, Repository Interface]
+    Infrastructure[Infrastructure Layer<br/>Repository 구현체, JPA Entity]
 
-    ProductBC -->|LikeFacade| LikeBC
-    LikeBC -->|ProductFacade| ProductBC
-    OrderBC -->|ProductFacade| ProductBC
-    OrderBC -->|PointFacade| PointBC
+    Interfaces -->|의존| Application
+    Application -->|의존| Domain
+    Infrastructure -.->|구현| Domain
 
-    style ProductBC fill:#e1f5ff
-    style LikeBC fill:#fff4e1
-    style OrderBC fill:#e8f5e9
-    style PointBC fill:#f3e5f5
+    style Domain fill:#e8f5e9,stroke:#4caf50,stroke-width:3px
+    style Infrastructure fill:#fff4e1,stroke:#ff9800,stroke-width:2px
+    style Application fill:#e1f5ff,stroke:#2196f3,stroke-width:2px
+    style Interfaces fill:#f3e5f5,stroke:#9c27b0,stroke-width:2px
 ```
 
-- **Product BC** ↔ **Like BC**: 양방향 협력 (Facade를 통해)
-- **Order BC** → **Product BC**: 단방향 협력 (재고 차감)
-- **Order BC** → **Point BC**: 단방향 협력 (포인트 차감)
+**핵심 원칙**:
+- **Domain Layer는 독립적**: 다른 계층에 의존하지 않음
+- **Repository Interface는 Domain에 위치**: 도메인이 필요로 하는 계약 정의
+- **Infrastructure는 Domain을 구현**: 점선 화살표 (구현 관계)
+- **의존성 방향**: `Interfaces → Application → Domain ← Infrastructure` (DIP)

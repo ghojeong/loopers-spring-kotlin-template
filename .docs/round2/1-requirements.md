@@ -2,6 +2,25 @@
 
 이커머스 시스템의 상품, 브랜드, 좋아요, 주문 도메인에 대한 기능 요구사항을 정리
 
+## 도메인 모델링 원칙
+
+이 요구사항은 **도메인 주도 설계(DDD)** 와 **레이어드 아키텍처** 를 기반으로 구현됩니다.
+
+### Entity vs Value Object vs Domain Service
+
+- **Entity**: 고유 식별자를 가지며 생명주기가 독립적인 객체 (User, Product, Order, Brand, Like)
+- **Value Object (VO)**: 식별자 없이 값으로만 구분되는 불변 객체 (Money, Price)
+- **Domain Service**: 여러 도메인 객체의 협력이 필요한 로직을 처리하는 무상태 서비스
+
+### 레이어별 책임
+
+```
+[Interfaces Layer]  → 요청/응답 처리, 검증
+[Application Layer] → 유스케이스 조율 (경량)
+[Domain Layer]      → 비즈니스 로직의 핵심 (Entity, VO, Domain Service, Repository Interface)
+[Infrastructure]    → 외부 기술 의존 (JPA 구현, Repository 구현체)
+```
+
 ## 유비쿼터스 언어
 
 | 한글 | 영문 | 설명 |
@@ -30,6 +49,10 @@
   - 브랜드 정보(ID, 이름 등)를 반환한다.
 - **제약사항**
   - 존재하지 않는 브랜드 조회 시 적절한 에러 메시지 제공
+- **도메인 객체 책임**
+  - `Brand (Entity)`: 브랜드 기본 정보 보유
+  - `BrandRepository (Interface in Domain)`: 브랜드 조회 인터페이스
+  - `BrandRepositoryImpl (in Infrastructure)`: JPA 기반 구현체
 
 #### 1.2 상품 목록 조회
 
@@ -48,6 +71,11 @@
 - **제약사항**
   - 정렬 기준은 latest, price_asc, likes_desc만 지원
   - 페이징 정보(전체 개수, 현재 페이지 등) 포함
+- **도메인 객체 책임**
+  - `Product (Entity)`: 상품 정보와 가격 정보 보유
+  - `Price (VO)`: 금액과 통화 정보를 불변 객체로 표현
+  - `ProductRepository (Interface in Domain)`: 정렬/필터링 조회 인터페이스
+  - `ProductQueryService (Domain Service)`: 상품 목록 조회와 좋아요 수 집계를 조합
 
 #### 1.3 상품 상세 조회
 
@@ -60,6 +88,10 @@
 - **제약사항**
   - 총 좋아요 수를 포함하여 반환
   - 현재 재고 수량 정보 포함
+- **도메인 객체 책임**
+  - `Product (Entity)`: 상품 기본 정보, Brand 참조, 재고 확인 메서드 제공
+  - `Stock (Entity)`: 재고 수량 관리 (Product와 1:1)
+  - `ProductQueryService (Domain Service)`: Product + Brand + Like 정보 조합
 
 ### 2. 좋아요 (Like)
 
@@ -78,6 +110,11 @@
   - 사용자당 상품당 1개의 좋아요만 가능
   - 멱등성 보장: 동일 요청 반복 시 중복 생성 없음
   - 존재하지 않는 상품에 대한 좋아요는 불가능
+- **도메인 객체 책임**
+  - `Like (Entity)`: User와 Product 간 관계를 표현, 좋아요 등록 시점 기록
+  - `LikeService (Domain Service)`: 중복 확인 로직, 멱등성 보장
+  - `LikeRepository (Interface in Domain)`: 좋아요 저장/조회 인터페이스
+  - `ProductRepository (Interface in Domain)`: 상품 존재 여부 확인
 
 #### 2.2 상품 좋아요 취소
 
@@ -93,6 +130,9 @@
 - **제약사항**
   - 멱등성 보장: 동일 요청 반복 시 에러 없음
   - 존재하지 않는 상품에 대한 취소 요청 시 적절한 처리
+- **도메인 객체 책임**
+  - `LikeService (Domain Service)`: 존재 확인 로직, 멱등성 보장
+  - `LikeRepository (Interface in Domain)`: 좋아요 삭제 인터페이스
 
 #### 2.3 좋아요한 상품 목록 조회
 
@@ -105,6 +145,8 @@
 - **제약사항**
   - 페이징 처리 지원
   - 좋아요한 순서(최신순) 정렬
+- **도메인 객체 책임**
+  - `LikeRepository (Interface in Domain)`: 사용자별 좋아요 목록 조회
 
 ### 3. 주문 / 결제 (Orders)
 
@@ -142,6 +184,17 @@
   - 재고 부족
   - 포인트 부족
   - 외부 시스템 연동 실패
+- **도메인 객체 책임**
+  - `Order (Entity, Aggregate Root)`: 주문 정보, OrderItem 집합 관리, 총액 계산 메서드 제공
+  - `OrderItem (Entity)`: 주문 항목, 상품 스냅샷(상품명, 브랜드 정보, 가격) 보관
+  - `Money (VO)`: 금액 연산 (총액 계산, 포인트 차감 등)
+  - `Stock (Entity)`: 재고 차감 메서드 (`decrease()`), 재고 확인 메서드 (`isAvailable()`)
+  - `Point (Entity)`: 포인트 차감 메서드 (`deduct()`), 잔액 확인 메서드 (`canDeduct()`)
+  - `OrderService (Domain Service)`: Order, Stock, Point 협력 조율, 트랜잭션 경계
+  - `ProductRepository (Interface in Domain)`: 상품 조회
+  - `StockRepository (Interface in Domain)`: 재고 조회/수정 (비관적 락)
+  - `PointRepository (Interface in Domain)`: 포인트 조회/수정 (비관적 락)
+  - `OrderRepository (Interface in Domain)`: 주문 저장
 
 #### 3.2 주문 목록 조회
 
@@ -154,6 +207,8 @@
 - **제약사항**
   - 페이징 처리 지원
   - 최신 주문순 정렬
+- **도메인 객체 책임**
+  - `OrderRepository (Interface in Domain)`: 사용자별 주문 목록 조회
 
 #### 3.3 주문 상세 조회
 
@@ -168,6 +223,9 @@
 - **제약사항**
   - 본인의 주문만 조회 가능
   - 주문 항목 정보 포함
+- **도메인 객체 책임**
+  - `Order (Entity, Aggregate Root)`: 주문 소유자 확인 메서드 (`isOwnedBy(userId)`)
+  - `OrderRepository (Interface in Domain)`: 주문 ID로 조회 (OrderItem 포함)
 
 ## 비기능 요구사항
 

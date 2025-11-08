@@ -2,6 +2,29 @@
 
 이커머스 시스템의 데이터베이스 테이블 구조와 관계를 정의
 
+## 도메인 모델과 ERD의 관계
+
+### Entity → 테이블 매핑
+
+- **Entity**: 고유 식별자를 가진 도메인 객체 → **테이블**로 매핑
+  - 예: `User` Entity → `users` 테이블
+  - 예: `Product` Entity → `products` 테이블
+  - 예: `Order` Entity (Aggregate Root) → `orders` 테이블
+
+### Value Object → 컬럼 매핑
+
+- **Value Object (VO)**: 불변 객체, 식별자 없음 → **테이블 컬럼**으로 매핑
+  - 예: `Price` VO → `price_amount`, `price_currency` 컬럼
+  - 예: `Money` VO → `balance`, `currency` 컬럼
+  - VO는 별도 테이블이 아닌, 소유 Entity의 테이블에 임베드됨
+
+### Aggregate → 테이블 관계
+
+- **Aggregate Root**: 독립적인 테이블
+  - 예: `Order` Aggregate Root → `orders` 테이블
+- **Aggregate 내부 Entity**: 외래키로 Aggregate Root 참조
+  - 예: `OrderItem` → `order_items` 테이블 (order_id FK)
+
 ## 전체 ERD
 
 ```mermaid
@@ -87,6 +110,8 @@ erDiagram
 
 ### 1. users (사용자)
 
+**도메인 모델 매핑**: `User` Entity
+
 사용자 기본 정보를 저장
 
 | 컬럼명 | 타입 | 제약조건 | 설명 |
@@ -107,6 +132,8 @@ erDiagram
 
 ### 2. brands (브랜드)
 
+**도메인 모델 매핑**: `Brand` Entity
+
 브랜드 정보를 저장
 
 | 컬럼명 | 타입 | 제약조건 | 설명 |
@@ -123,6 +150,8 @@ erDiagram
   - 브랜드 이름은 유니크하게 관리
 
 ### 3. products (상품)
+
+**도메인 모델 매핑**: `Product` Entity + `Price` Value Object
 
 상품 정보를 저장
 
@@ -144,10 +173,15 @@ erDiagram
   - `brand_id` REFERENCES `brands(id)` ON DELETE RESTRICT
 - **설계 포인트**
   - 가격은 DECIMAL로 정확한 계산 보장
+  - **Price VO 매핑**: `price_amount`, `price_currency` 컬럼으로 임베드
+    - `Price` VO는 별도 테이블이 아닌 Product의 컬럼으로 저장
+    - VO의 불변성과 도메인 로직은 애플리케이션 레벨에서 보장
   - price_amount와 price_currency를 분리하여 다국가 지원
   - 브랜드 삭제 시 상품 삭제 방지 (RESTRICT)
 
 ### 4. stocks (재고)
+
+**도메인 모델 매핑**: `Stock` Entity
 
 상품의 재고 정보를 저장
 
@@ -169,6 +203,8 @@ erDiagram
   - 상품 삭제 시 재고도 함께 삭제 (CASCADE)
 
 ### 5. likes (좋아요)
+
+**도메인 모델 매핑**: `Like` Entity
 
 사용자의 상품 좋아요 정보를 저장
 
@@ -194,6 +230,8 @@ erDiagram
 
 ### 6. orders (주문)
 
+**도메인 모델 매핑**: `Order` Entity (Aggregate Root) + `Money` Value Object
+
 주문 정보를 저장
 
 | 컬럼명 | 타입 | 제약조건 | 설명 |
@@ -213,11 +251,16 @@ erDiagram
 - **외래키**
   - `user_id` REFERENCES `users(id)` ON DELETE RESTRICT
 - **설계 포인트**
+  - **Money VO 매핑**: `total_amount`, `currency` 컬럼으로 임베드
+    - `Money` VO는 별도 테이블이 아닌 Order의 컬럼으로 저장
+  - **Aggregate Root**: Order는 OrderItem을 포함하는 집합체의 루트
   - status는 VARCHAR로 저장 (PENDING, CONFIRMED, SHIPPED, DELIVERED, CANCELLED)
   - 사용자 삭제 시 주문 삭제 방지 (RESTRICT)
   - 주문 일시 기준 정렬을 위한 인덱스
 
 ### 7. order_items (주문 항목)
+
+**도메인 모델 매핑**: `OrderItem` Entity + `Price` Value Object
 
 주문에 포함된 상품 정보를 저장 (주문 시점의 상품 및 브랜드 정보 스냅샷)
 
@@ -244,12 +287,17 @@ erDiagram
 - **제약조건**
   - CHECK: `quantity > 0` (수량은 1개 이상)
 - **설계 포인트**
+  - **Aggregate 구성**: Order Aggregate에 속하는 Entity
+  - **Price VO 매핑**: `price_at_order`, `currency` 컬럼으로 임베드
+  - **스냅샷 패턴**: 주문 시점의 상품명, 브랜드 정보, 가격을 별도 컬럼으로 저장
+    - 상품/브랜드 정보 변경에 영향받지 않음 (주문 이력 보존)
+    - product_id는 참조용으로 유지하되, 실제 표시는 스냅샷 데이터 사용
   - 주문 삭제 시 항목도 함께 삭제 (CASCADE)
   - 상품 삭제 시 항목 삭제 방지 (RESTRICT) - 주문 이력 보존
-  - 주문 시점의 상품명, 브랜드 정보(ID, 이름, 설명), 가격을 스냅샷으로 저장하여 상품/브랜드 정보 변경에 영향받지 않음
-  - product_id는 참조용으로 유지하되, 실제 표시는 스냅샷 데이터 사용
 
 ### 8. points (포인트)
+
+**도메인 모델 매핑**: `Point` Entity + `Money` Value Object
 
 사용자의 포인트 정보를 저장
 
@@ -267,6 +315,8 @@ erDiagram
 - **제약조건**
   - CHECK: `balance >= 0` (포인트는 음수 불가)
 - **설계 포인트**
+  - **Money VO 매핑**: `balance`, `currency` 컬럼으로 임베드
+    - `Money` VO는 별도 테이블이 아닌 Point의 컬럼으로 저장
   - user_id를 PK로 사용 (1:1 관계)
   - 비관적 락(SELECT FOR UPDATE)으로 동시성 제어
   - 사용자 삭제 시 포인트도 함께 삭제 (CASCADE)
