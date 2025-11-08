@@ -1,9 +1,9 @@
-⏺ Read(apps/commerce-api/src/main/kotlin/com/loopers/domain/like/LikeService.kt)
-  ⎿  Read 38 lines
-
-⏺ 모든 레이어의 구현이 완료되었습니다!
-
 # 완료된 구현
+
+- FETCH JOIN이 아닌 일반 LEFT JOIN을 사용한 이유
+  - FETCH JOIN은 연관 엔티티를 즉시 로딩하기 위한 것
+  - 여기서는 COUNT 집계를 위한 조인이므로 일반 LEFT JOIN이 적절
+  - FETCH JOIN은 GROUP BY와 함께 사용할 수 없습니다
 
 ## 1. Domain Layer ✓
 
