@@ -36,4 +36,57 @@ class ProductTest {
         }.isInstanceOf(CoreException::class.java)
             .hasMessageContaining("상품명")
     }
+
+    @Test
+    fun `상품 가격을 변경할 수 있다`() {
+        // given
+        val brand = Brand(name = "나이키", description = "스포츠 브랜드")
+        val product = Product(
+            name = "운동화",
+            price = Price(BigDecimal("100000"), Currency.KRW),
+            brand = brand
+        )
+        val newPrice = Price(BigDecimal("150000"), Currency.KRW)
+
+        // when
+        product.updatePrice(newPrice)
+
+        // then
+        assertThat(product.price).isEqualTo(newPrice)
+        assertThat(product.price.amount).isEqualTo(BigDecimal("150000"))
+    }
+
+    @Test
+    fun `상품명을 변경할 수 있다`() {
+        // given
+        val brand = Brand(name = "나이키", description = "스포츠 브랜드")
+        val product = Product(
+            name = "운동화",
+            price = Price(BigDecimal("100000"), Currency.KRW),
+            brand = brand
+        )
+
+        // when
+        product.updateName("새운동화")
+
+        // then
+        assertThat(product.name).isEqualTo("새운동화")
+    }
+
+    @Test
+    fun `상품명을 빈 문자열로 변경하면 예외가 발생한다`() {
+        // given
+        val brand = Brand(name = "나이키", description = "스포츠 브랜드")
+        val product = Product(
+            name = "운동화",
+            price = Price(BigDecimal("100000"), Currency.KRW),
+            brand = brand
+        )
+
+        // when & then
+        assertThatThrownBy {
+            product.updateName("")
+        }.isInstanceOf(CoreException::class.java)
+            .hasMessageContaining("상품명")
+    }
 }

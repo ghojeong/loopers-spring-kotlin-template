@@ -35,4 +35,15 @@ class Product(
             throw CoreException(ErrorType.BAD_REQUEST, "상품명은 비어있을 수 없습니다.")
         }
     }
+
+    fun updatePrice(newPrice: Price) {
+        this.price = newPrice
+    }
+
+    fun updateName(newName: String) {
+        require(newName.isNotBlank()) {
+            throw CoreException(ErrorType.BAD_REQUEST, "상품명은 비어있을 수 없습니다.")
+        }
+        this.name = newName
+    }
 }

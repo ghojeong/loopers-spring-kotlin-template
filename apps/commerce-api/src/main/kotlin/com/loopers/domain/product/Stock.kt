@@ -19,7 +19,7 @@ class Stock(
         protected set
 
     @Column(name = "updated_at", nullable = false)
-    lateinit var updatedAt: ZonedDateTime
+    var updatedAt: ZonedDateTime = ZonedDateTime.now()
         protected set
 
     init {
