@@ -34,6 +34,8 @@
 | 재고 | Stock | 상품의 판매 가능 수량 |
 | 포인트 | Point | 결제에 사용되는 가상 화폐 |
 | 가격 | Price | 상품의 금액 |
+| 쿠폰 | Coupon | 할인을 제공하는 쿠폰 (정액/정률) |
+| 사용자 쿠폰 | UserCoupon | 사용자가 소유한 쿠폰 (1회 사용 제한) |
 
 ## 도메인별 요구사항
 
@@ -226,12 +228,44 @@
 - **도메인 객체 책임**
   - `LikeRepository (Interface in Domain)`: 사용자별 좋아요 목록 조회
 
-### 5. 주문 / 결제 (Orders)
+### 5. 쿠폰 (Coupon)
 
-#### 5.1 주문 생성
+#### 5.1 쿠폰 도메인
+
+- **유저 스토리**
+  - 사용자는 주문 시 쿠폰을 사용하여 할인을 받을 수 있다.
+  - 쿠폰은 정액 할인(FIXED_AMOUNT) 또는 정률 할인(PERCENTAGE) 방식을 지원한다.
+  - 각 쿠폰은 1회만 사용 가능하다.
+- **기능 흐름**
+  - 1. 사용자는 쿠폰을 소유한다 (UserCoupon).
+  - 2. 주문 생성 시 쿠폰 ID를 선택적으로 제공한다.
+  - 3. 쿠폰 서비스가 쿠폰 사용 가능 여부를 확인한다 (비관적 락 사용).
+    - 사용자가 소유한 쿠폰인지 확인
+    - 아직 사용되지 않았는지 확인
+  - 4. 쿠폰을 사용 상태로 변경하고 할인 금액을 계산한다.
+  - 5. 할인이 적용된 최종 금액으로 포인트를 차감한다.
+- **제약사항**
+  - 쿠폰은 1회만 사용 가능 (isUsed 플래그)
+  - 이미 사용된 쿠폰 재사용 시 400 에러
+  - 다른 사용자의 쿠폰 사용 시 404 에러
+  - 정률 할인은 최대 100%까지 가능
+  - 할인 금액은 주문 금액을 초과할 수 없음
+  - 동시성 제어: 비관적 락(SELECT FOR UPDATE) 사용
+- **도메인 객체 책임**
+  - `Coupon (Entity)`: 쿠폰 기본 정보 (이름, 할인 타입, 할인 값), `calculateDiscount()` 메서드
+  - `UserCoupon (Entity)`: 사용자 쿠폰 소유 관계, 사용 상태 관리 (`canUse()`, `use()` 메서드)
+  - `CouponType (Enum)`: 할인 타입 (FIXED_AMOUNT, PERCENTAGE)
+  - `CouponService (Domain Service)`: 쿠폰 사용 로직 (`useUserCoupon()`), 비관적 락을 통한 동시성 제어
+  - `CouponRepository (Interface in Domain)`: 쿠폰 조회 인터페이스
+  - `UserCouponRepository (Interface in Domain)`: 사용자 쿠폰 조회/저장 인터페이스 (`findByIdAndUserIdWithLock()` 포함)
+
+### 6. 주문 / 결제 (Orders)
+
+#### 6.1 주문 생성
 
 - **유저 스토리**
   - 로그인한 사용자는 여러 상품을 한 번에 주문할 수 있다.
+  - 주문 시 쿠폰을 사용하여 할인을 받을 수 있다 (선택적).
   - 주문 시 재고가 부족하면 주문이 실패한다.
   - 주문 시 보유 포인트가 부족하면 주문이 실패한다.
   - 주문 정보는 외부 시스템으로 전송된다.
@@ -243,14 +277,18 @@
   - 3. 각 상품의 재고를 확인한다.
     - 재고가 부족하면 주문 실패 (400 에러)
   - 4. 총 주문 금액을 계산한다.
-  - 5. 사용자의 보유 포인트를 확인한다.
+  - 5. 쿠폰을 적용한다 (couponId가 제공된 경우).
+    - 쿠폰 사용 가능 여부 확인 및 사용 처리 (비관적 락)
+    - 할인 금액 계산
+    - 최종 결제 금액 = 주문 금액 - 할인 금액
+  - 6. 사용자의 보유 포인트를 확인한다.
     - 포인트가 부족하면 주문 실패 (400 에러)
-  - 6. 트랜잭션으로 다음을 처리한다:
+  - 7. 트랜잭션으로 다음을 처리한다:
     - 주문 정보 저장
     - 각 상품의 재고 차감
-    - 사용자 포인트 차감
-  - 7. 외부 시스템으로 주문 정보를 전송한다 (비동기 또는 Mock 가능).
-  - 8. 주문 결과를 반환한다.
+    - 사용자 포인트 차감 (할인 적용 후 금액)
+  - 8. 외부 시스템으로 주문 정보를 전송한다 (비동기 또는 Mock 가능).
+  - 9. 주문 결과를 반환한다.
 - **제약사항**
   - 재고 차감, 포인트 차감, 주문 저장은 트랜잭션으로 처리
   - 재고 부족 시 명확한 에러 메시지
@@ -265,16 +303,21 @@
 - **도메인 객체 책임**
   - `Order (Entity, Aggregate Root)`: 주문 정보, OrderItem 집합 관리, 총액 계산 메서드 제공
   - `OrderItem (Entity)`: 주문 항목, 상품 스냅샷(상품명, 브랜드 정보, 가격) 보관
-  - `Money (VO)`: 금액 연산 (총액 계산, 포인트 차감 등)
+  - `Money (VO)`: 금액 연산 (총액 계산, 포인트 차감, 할인 금액 계산 등)
   - `Stock (Entity)`: 재고 차감 메서드 (`decrease()`), 재고 확인 메서드 (`isAvailable()`)
   - `Point (Entity)`: 포인트 차감 메서드 (`deduct()`), 잔액 확인 메서드 (`canDeduct()`)
+  - `Coupon (Entity)`: 할인 금액 계산 메서드 (`calculateDiscount()`)
+  - `UserCoupon (Entity)`: 쿠폰 사용 상태 관리 (`canUse()`, `use()`)
   - `OrderService (Domain Service)`: Order, Stock, Point 협력 조율, 트랜잭션 경계
+  - `CouponService (Domain Service)`: 쿠폰 사용 로직 (`useUserCoupon()`), 비관적 락을 통한 동시성 제어
+  - `OrderFacade (Application Service)`: 주문 생성 흐름 조율, 쿠폰 적용 및 할인 계산 통합
   - `ProductRepository (Interface in Domain)`: 상품 조회
   - `StockRepository (Interface in Domain)`: 재고 조회/수정 (비관적 락)
   - `PointRepository (Interface in Domain)`: 포인트 조회/수정 (비관적 락)
+  - `UserCouponRepository (Interface in Domain)`: 사용자 쿠폰 조회/수정 (비관적 락)
   - `OrderRepository (Interface in Domain)`: 주문 저장
 
-#### 5.2 주문 목록 조회
+#### 6.2 주문 목록 조회
 
 - **유저 스토리**
   - 로그인한 사용자는 자신의 주문 목록을 조회할 수 있다.
@@ -288,7 +331,7 @@
 - **도메인 객체 책임**
   - `OrderRepository (Interface in Domain)`: 사용자별 주문 목록 조회
 
-#### 5.3 주문 상세 조회
+#### 6.3 주문 상세 조회
 
 - **유저 스토리**
   - 로그인한 사용자는 자신의 특정 주문의 상세 정보를 조회할 수 있다.

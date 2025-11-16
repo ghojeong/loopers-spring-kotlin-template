@@ -384,10 +384,11 @@ sequenceDiagram
     participant OrderFacade
     participant ProductQueryService
     participant StockService
+    participant CouponService
     participant PointService
     participant OrderService
 
-    User->>OrderV1Controller: POST /orders {items: [{productId, quantity}]}
+    User->>OrderV1Controller: POST /orders {items: [{productId, quantity}], couponId?}
     Note over OrderV1Controller: [Interfaces Layer]<br/>X-USER-ID 헤더 검증
 
     OrderV1Controller->>OrderFacade: createOrder(userId, orderRequest)
@@ -417,7 +418,26 @@ sequenceDiagram
 
     Note over OrderFacade: === 트랜잭션 시작 (@Transactional) ===
 
-    OrderFacade->>PointService: validateUserPoint(userId, totalAmount)
+    Note over OrderFacade: 3. 쿠폰 적용 (선택적)
+    alt couponId가 있는 경우
+        OrderFacade->>CouponService: useUserCoupon(userId, couponId)
+        Note over CouponService: findByIdAndUserIdWithLock<br/>(PESSIMISTIC_WRITE)
+        alt 쿠폰 미존재 또는 타인 쿠폰
+            CouponService-->>OrderFacade: CoreException (쿠폰을 찾을 수 없음)
+            OrderFacade-->>OrderV1Controller: 404 Error
+            OrderV1Controller-->>User: 404 Not Found
+        end
+        alt 이미 사용된 쿠폰
+            CouponService-->>OrderFacade: CoreException (이미 사용된 쿠폰)
+            OrderFacade-->>OrderV1Controller: 400 Error
+            OrderV1Controller-->>User: 400 Bad Request
+        end
+        Note over CouponService: UserCoupon.use()<br/>Coupon.calculateDiscount()
+        CouponService-->>OrderFacade: UserCoupon (할인 금액 포함)
+        Note over OrderFacade: 최종 금액 = 총액 - 할인 금액
+    end
+
+    OrderFacade->>PointService: validateUserPoint(userId, finalAmount)
     Note over PointService: findByUserIdWithLock<br/>(비관적 락으로 조회 및 검증)
     alt 포인트 부족
         PointService-->>OrderFacade: InsufficientPointException
@@ -425,20 +445,20 @@ sequenceDiagram
         OrderV1Controller-->>User: 400 Bad Request (포인트 부족)
     end
 
-    Note over OrderFacade: 3. 주문 생성
+    Note over OrderFacade: 4. 주문 생성
     OrderFacade->>OrderService: createOrder(userId, orderItems)
     Note over OrderService: Order Entity 생성 및 저장
     OrderService-->>OrderFacade: Order
 
-    Note over OrderFacade: 4. 재고 차감 (비관적 락)
+    Note over OrderFacade: 5. 재고 차감 (비관적 락)
     loop 각 주문 항목 (정렬된 순서로)
         OrderFacade->>StockService: decreaseStock(productId, quantity)
         Note over StockService: findByProductIdWithLock<br/>(PESSIMISTIC_WRITE)
         StockService-->>OrderFacade: Stock (updated)
     end
 
-    Note over OrderFacade: 5. 포인트 차감 (비관적 락)
-    OrderFacade->>PointService: deductPoint(userId, totalAmount)
+    Note over OrderFacade: 6. 포인트 차감 (비관적 락)
+    OrderFacade->>PointService: deductPoint(userId, finalAmount)
     Note over PointService: findByUserIdWithLock<br/>(PESSIMISTIC_WRITE)<br/>Point.deduct() 호출
     PointService-->>OrderFacade: Point (updated)
 
@@ -450,15 +470,18 @@ sequenceDiagram
 
 - **레이어별 책임**
   - `OrderV1Controller (Interfaces)`: HTTP 요청 검증 및 응답 변환
-  - `OrderFacade (Application)`: 유스케이스 흐름 조율, 트랜잭션 경계, OrderItem 스냅샷 생성
+  - `OrderFacade (Application)`: 유스케이스 흐름 조율, 트랜잭션 경계, OrderItem 스냅샷 생성, 쿠폰 적용 및 할인 계산 통합
   - `OrderService (Domain Service)`: 주문 생성 및 저장
   - `StockService (Domain Service)`: 재고 검증 및 차감 (비관적 락)
+  - `CouponService (Domain Service)`: 쿠폰 사용 및 할인 계산 (비관적 락)
   - `PointService (Domain Service)`: 포인트 검증 및 차감 (비관적 락)
   - `ProductQueryService (Domain Service)`: 상품과 재고 조회
   - `Order (Entity, Aggregate Root)`: 주문 정보, OrderItem 관리, 총액 계산
   - `OrderItem (Entity)`: 상품/브랜드 스냅샷 보존
   - `Stock (Entity)`: 재고 관리, `decrease()`, `isAvailable()` 메서드
   - `Point (Entity)`: 포인트 관리, `deduct()`, `canDeduct()` 메서드
+  - `Coupon (Entity)`: 쿠폰 정보, `calculateDiscount()` 메서드
+  - `UserCoupon (Entity)`: 사용자 쿠폰 소유 관계, `canUse()`, `use()` 메서드
   - `Money (VO)`: 금액 연산
 - **설계 포인트**
   - **Facade 패턴**: OrderFacade가 여러 Domain Service를 조율

@@ -114,6 +114,27 @@ erDiagram
         timestamp deleted_at
     }
 
+    coupons {
+        bigint id PK
+        varchar name
+        varchar discount_type
+        decimal discount_value
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
+    user_coupons {
+        bigint id PK
+        bigint user_id FK
+        bigint coupon_id FK
+        boolean is_used
+        timestamp used_at
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
     users ||--o{ likes : "has"
     products ||--o{ likes : "receives"
     brands ||--o{ products : "has"
@@ -122,6 +143,8 @@ erDiagram
     orders ||--o{ order_items : "contains"
     products ||--o{ order_items : "in"
     users ||--|| points : "has"
+    users ||--o{ user_coupons : "has"
+    coupons ||--o{ user_coupons : "issued to"
 ```
 
 ## 테이블 상세 설명
@@ -345,6 +368,67 @@ erDiagram
   - 사용자 삭제 시 포인트도 함께 삭제 (CASCADE)
   - 소프트 삭제 지원 (`deleted_at`)
 
+### 9. coupons (쿠폰)
+
+**도메인 모델 매핑**: `Coupon` Entity
+
+쿠폰 기본 정보를 저장
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 쿠폰 고유 식별자 |
+| name | VARCHAR(255) | NOT NULL | 쿠폰 이름 |
+| discount_type | VARCHAR(20) | NOT NULL | 할인 타입 (FIXED_AMOUNT, PERCENTAGE) |
+| discount_value | DECIMAL(15,2) | NOT NULL | 할인 값 (정액: 금액, 정률: 퍼센트) |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+- **제약조건**
+  - CHECK: `discount_value > 0` (할인 값은 양수)
+  - CHECK: `discount_type IN ('FIXED_AMOUNT', 'PERCENTAGE')`
+- **설계 포인트**
+  - 정액 할인(FIXED_AMOUNT): discount_value는 할인 금액
+  - 정률 할인(PERCENTAGE): discount_value는 할인 퍼센트 (예: 10.00 = 10%)
+  - 할인 금액은 주문 금액을 초과할 수 없음 (비즈니스 로직에서 처리)
+  - 소프트 삭제 지원 (`deleted_at`)
+
+### 10. user_coupons (사용자 쿠폰)
+
+**도메인 모델 매핑**: `UserCoupon` Entity
+
+사용자가 소유한 쿠폰 정보 및 사용 상태를 저장
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 사용자 쿠폰 고유 식별자 |
+| user_id | BIGINT | FK, NOT NULL | 사용자 식별자 |
+| coupon_id | BIGINT | FK, NOT NULL | 쿠폰 식별자 |
+| is_used | BOOLEAN | NOT NULL, DEFAULT FALSE | 사용 여부 |
+| used_at | TIMESTAMP | NULL | 사용 일시 |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 발급 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - INDEX: `user_id` (사용자별 쿠폰 조회)
+  - INDEX: `coupon_id` (쿠폰별 발급 내역 조회)
+- **외래키**
+  - `user_id` REFERENCES `users(id)` ON DELETE CASCADE
+  - `coupon_id` REFERENCES `coupons(id)` ON DELETE CASCADE
+- **제약조건**
+  - CHECK: `used_at IS NULL OR is_used = TRUE` (사용 일시가 있으면 사용 상태여야 함)
+- **설계 포인트**
+  - 사용자와 N:1 관계 (한 사용자가 여러 쿠폰 소유 가능)
+  - 쿠폰과 N:1 관계 (동일한 쿠폰을 여러 사용자가 소유 가능)
+  - 1회만 사용 가능 (is_used 플래그)
+  - 비관적 락(SELECT FOR UPDATE)으로 동시성 제어
+  - 사용자 또는 쿠폰 삭제 시 사용자 쿠폰도 함께 삭제 (CASCADE)
+  - 소프트 삭제 지원 (`deleted_at`)
+
 ## 관계 정리
 
 ### 1:1 관계
@@ -360,6 +444,8 @@ erDiagram
 - `users` → `orders`: 하나의 사용자는 여러 주문을 할 수 있음
 - `orders` → `order_items`: 하나의 주문은 여러 항목을 포함함
 - `products` → `order_items`: 하나의 상품은 여러 주문에 포함될 수 있음
+- `users` → `user_coupons`: 하나의 사용자는 여러 쿠폰을 소유할 수 있음
+- `coupons` → `user_coupons`: 하나의 쿠폰은 여러 사용자에게 발급될 수 있음
 
 ### N:M 관계
 
@@ -391,6 +477,8 @@ erDiagram
 
 - `stocks`: 재고 차감 시 비관적 락으로 동시성 제어
 - `points`: 포인트 차감 시 비관적 락으로 동시성 제어
+- `user_coupons`: 쿠폰 사용 시 비관적 락으로 동시성 제어 (중복 사용 방지)
+- `likes`: 좋아요 등록 시 비관적 락으로 동시성 제어 (멱등성 보장)
 
 동작 방식
 

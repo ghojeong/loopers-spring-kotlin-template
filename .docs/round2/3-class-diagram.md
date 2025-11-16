@@ -125,6 +125,36 @@ classDiagram
         +canDeduct(Money) boolean
     }
 
+    class Coupon {
+        <<Entity>>
+        +Long id
+        +String name
+        +CouponType discountType
+        +BigDecimal discountValue
+        +LocalDateTime createdAt
+        +LocalDateTime updatedAt
+        +calculateDiscount(Money) Money
+    }
+
+    class UserCoupon {
+        <<Entity>>
+        +Long id
+        +Long userId
+        +Coupon coupon
+        +boolean isUsed
+        +LocalDateTime usedAt
+        +LocalDateTime createdAt
+        +LocalDateTime updatedAt
+        +canUse() boolean
+        +use() void
+    }
+
+    class CouponType {
+        <<Enumeration>>
+        FIXED_AMOUNT
+        PERCENTAGE
+    }
+
     Brand "1" --> "*" Product : has
     Product "1" --> "1" Price : contains (VO)
     Product "1" --> "1" Stock : has
@@ -133,10 +163,13 @@ classDiagram
     OrderItem "1" --> "1" Money : uses (VO)
     Order "1" --> "1" Money : contains (VO)
     Point "1" --> "1" Money : contains (VO)
+    UserCoupon "*" --> "1" Coupon : references
+    Coupon "1" --> "1" CouponType : has
 
     note for Order "Aggregate Root: OrderItem은 Order를 통해서만 접근"
     note for Price "Value Object: 불변, 식별자 없음"
     note for Money "Value Object: 불변, 식별자 없음"
+    note for UserCoupon "사용자가 소유한 쿠폰, 1회 사용 제한"
 ```
 
 ## BaseEntity (모든 엔티티의 기본 클래스)
@@ -397,6 +430,48 @@ abstract class BaseEntity(
   - User와 1:1 관계
   - 동시성 제어 필요 (비관적 락 사용)
 
+### 11. Coupon (쿠폰)
+
+- **책임**
+  - 쿠폰 기본 정보 관리
+  - 할인 금액 계산
+- **속성**
+  - `id`: 쿠폰 식별자
+  - `name`: 쿠폰 이름
+  - `discountType`: 할인 타입 (CouponType)
+  - `discountValue`: 할인 값 (정액: 금액, 정률: 퍼센트)
+  - `createdAt`: 생성 일시
+  - `updatedAt`: 수정 일시
+- **메서드**
+  - `calculateDiscount(Money)`: 주문 금액에 대한 할인 금액 계산
+- **설계 포인트**
+  - Entity (id로 식별)
+  - CouponType enum을 통해 정액/정률 할인 구분
+  - 할인 금액은 주문 금액을 초과할 수 없음
+
+### 12. UserCoupon (사용자 쿠폰)
+
+- **책임**
+  - 사용자의 쿠폰 소유 관계 관리
+  - 쿠폰 사용 상태 관리
+- **속성**
+  - `id`: 사용자 쿠폰 식별자
+  - `userId`: 사용자 식별자
+  - `coupon`: 쿠폰 엔티티 (참조)
+  - `isUsed`: 사용 여부
+  - `usedAt`: 사용 일시
+  - `createdAt`: 발급 일시
+  - `updatedAt`: 수정 일시
+- **메서드**
+  - `canUse()`: 사용 가능 여부 확인
+  - `use()`: 쿠폰 사용 처리
+- **설계 포인트**
+  - Entity (id로 식별)
+  - User와 N:1 관계 (한 사용자가 여러 쿠폰 소유 가능)
+  - Coupon과 N:1 관계 (동일한 쿠폰을 여러 사용자가 소유 가능)
+  - 1회만 사용 가능 (isUsed 플래그)
+  - 동시성 제어 필요 (비관적 락 사용)
+
 ## Enum 정의
 
 ### Gender (성별)
@@ -430,6 +505,15 @@ enum class OrderStatus {
 }
 ```
 
+### CouponType (쿠폰 할인 타입)
+
+```kotlin
+enum class CouponType {
+    FIXED_AMOUNT,  // 정액 할인
+    PERCENTAGE     // 정률 할인 (%)
+}
+```
+
 ## 연관 관계 정리
 
 ### 단방향 연관 관계
@@ -441,6 +525,8 @@ enum class OrderStatus {
 - Order → User: 주문은 주문자를 알아야 함
 - OrderItem → Product: 주문 항목은 상품을 알아야 함
 - Point → User: 포인트는 소유자를 알아야 함
+- UserCoupon → User: 사용자 쿠폰은 소유자를 알아야 함
+- UserCoupon → Coupon: 사용자 쿠폰은 쿠폰 정보를 알아야 함
 
 ### 양방향 연관 관계 최소화
 
