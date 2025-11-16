@@ -1,5 +1,6 @@
 package com.loopers.application.order
 
+import com.loopers.domain.coupon.CouponService
 import com.loopers.domain.order.Money
 import com.loopers.domain.order.OrderItem
 import com.loopers.domain.order.OrderQueryService
@@ -23,20 +24,37 @@ class OrderFacade(
     private val productQueryService: ProductQueryService,
     private val stockService: StockService,
     private val pointService: PointService,
+    private val couponService: CouponService,
 ) {
     @Transactional
     fun createOrder(userId: Long, request: OrderCreateRequest): OrderCreateInfo {
         val orderItems = validateAndCreateOrderItems(request)
         val totalMoney = calculateTotalAmount(orderItems)
 
-        pointService.validateUserPoint(userId, totalMoney)
+        // 쿠폰 적용 및 할인 금액 계산
+        val discountAmount = applyCoupon(userId, request.couponId, totalMoney)
+        val finalAmount = totalMoney - discountAmount
+
+        pointService.validateUserPoint(userId, finalAmount)
 
         val order = orderService.createOrder(userId, orderItems)
 
         deductStocks(request.items)
-        pointService.deductPoint(userId, totalMoney)
+        pointService.deductPoint(userId, finalAmount)
 
         return OrderCreateInfo.from(order)
+    }
+
+    /**
+     * 쿠폰을 적용하고 할인 금액을 반환한다
+     */
+    private fun applyCoupon(userId: Long, couponId: Long?, totalAmount: Money): Money {
+        if (couponId == null) {
+            return Money(BigDecimal.ZERO, totalAmount.currency)
+        }
+
+        val userCoupon = couponService.useUserCoupon(userId, couponId)
+        return userCoupon.coupon.calculateDiscount(totalAmount)
     }
 
     private fun validateAndCreateOrderItems(

@@ -2,6 +2,7 @@ package com.loopers.application.order
 
 data class OrderCreateRequest(
     val items: List<OrderItemRequest>,
+    val couponId: Long? = null,
 )
 
 data class OrderItemRequest(

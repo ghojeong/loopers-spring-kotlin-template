@@ -32,3 +32,23 @@ fun createTestProduct(
         brand = brand,
     ).withId(id, createdAt, updatedAt)
 }
+
+/**
+ * Product 엔티티를 위한 테스트 픽스처 객체
+ */
+object ProductFixtures {
+    /**
+     * 기본 테스트용 상품을 생성합니다.
+     */
+    fun createProduct(
+        name: String = "테스트 상품",
+        price: BigDecimal = BigDecimal("100000"),
+        brand: Brand,
+    ): Product {
+        return Product(
+            name = name,
+            price = Price(price, Currency.KRW),
+            brand = brand,
+        )
+    }
+}
