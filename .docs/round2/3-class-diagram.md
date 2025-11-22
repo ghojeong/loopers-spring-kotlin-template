@@ -42,8 +42,11 @@ classDiagram
         +String name
         +Price price
         +Brand brand
+        +Long likeCount
         +LocalDateTime createdAt
         +checkStockAvailable(quantity) boolean
+        +incrementLikeCount() void
+        +decrementLikeCount() void
     }
 
     class Price {
@@ -268,20 +271,25 @@ abstract class BaseEntity(
   - 상품 기본 정보 관리
   - 재고 확인 로직
   - 브랜드 연관 관계
+  - 좋아요 수 관리 (비정규화)
 - **속성**
   - `id`: 상품 고유 식별자
   - `name`: 상품 이름
   - `price`: 상품 가격 (VO)
   - `brand`: 소속 브랜드
+  - `likeCount`: 좋아요 수 (비정규화)
   - `stock`: 재고 정보
   - `createdAt`: 등록 일시
 - **메서드**
   - `checkStockAvailable(quantity)`: 요청 수량만큼 재고가 있는지 확인
+  - `incrementLikeCount()`: 좋아요 수 증가
+  - `decrementLikeCount()`: 좋아요 수 감소
 - **설계 포인트**
   - Entity (식별자 존재)
   - Brand와 N:1 관계 (단방향)
   - Price를 VO로 포함
   - Stock과 1:1 관계
+  - **성능 최적화**: likeCount를 직접 보유하여 조회 성능 향상
 
 ### 4. Price (가격) - **Value Object**
 
@@ -875,27 +883,71 @@ class PointService(
 class ProductQueryService(
     private val productRepository: ProductRepository,
     private val stockRepository: StockRepository,
+    private val redisTemplate: RedisTemplate<String, String>,
+    private val objectMapper: ObjectMapper,
 ) {
+    companion object {
+        private const val PRODUCT_DETAIL_CACHE_PREFIX = "product:detail:"
+        private const val PRODUCT_LIST_CACHE_PREFIX = "product:list:"
+        private val PRODUCT_DETAIL_TTL = Duration.ofMinutes(10)
+        private val PRODUCT_LIST_TTL = Duration.ofMinutes(5)
+    }
+
     data class ProductDetailData(
         val product: Product,
         val stock: Stock,
     )
 
     fun findProducts(brandId: Long?, sort: String, pageable: Pageable): Page<Product> {
-        return productRepository.findAll(brandId, sort, pageable)
+        val cacheKey = buildProductListCacheKey(brandId, sort, pageable)
+
+        // 1. Redis에서 먼저 조회
+        val cached = redisTemplate.opsForValue().get(cacheKey)
+        if (cached != null) {
+            return objectMapper.readValue(cached)
+        }
+
+        // 2. DB 조회
+        val products = productRepository.findAll(brandId, sort, pageable)
+
+        // 3. Redis에 캐시 저장 (5분 TTL)
+        val cacheValue = objectMapper.writeValueAsString(products)
+        redisTemplate.opsForValue().set(cacheKey, cacheValue, PRODUCT_LIST_TTL)
+
+        return products
     }
 
     fun getProductDetail(productId: Long): ProductDetailData {
+        val cacheKey = "$PRODUCT_DETAIL_CACHE_PREFIX$productId"
+
+        // 1. Redis에서 먼저 조회
+        val cached = redisTemplate.opsForValue().get(cacheKey)
+        if (cached != null) {
+            return objectMapper.readValue(cached)
+        }
+
+        // 2. DB 조회
         val product = productRepository.findById(productId)
             ?: throw CoreException(ErrorType.NOT_FOUND, "상품을 찾을 수 없습니다: $productId")
         val stock = stockRepository.findByProductId(productId)
             ?: throw CoreException(ErrorType.NOT_FOUND, "재고 정보를 찾을 수 없습니다: $productId")
-        return ProductDetailData(product, stock)
+        val productDetailData = ProductDetailData(product, stock)
+
+        // 3. Redis에 캐시 저장 (10분 TTL)
+        val cacheValue = objectMapper.writeValueAsString(productDetailData)
+        redisTemplate.opsForValue().set(cacheKey, cacheValue, PRODUCT_DETAIL_TTL)
+
+        return productDetailData
     }
 
     fun getProductsByIds(productIds: List<Long>): List<Product> {
         // 삭제되지 않은 상품만 조회 (deletedAt IS NULL)
         return productRepository.findByIdInAndDeletedAtIsNull(productIds)
+    }
+
+    private fun buildProductListCacheKey(brandId: Long?, sort: String, pageable: Pageable): String {
+        val brand = brandId ?: "all"
+        return "${PRODUCT_LIST_CACHE_PREFIX}brand:$brand:sort:$sort:page:${pageable.pageNumber}:size:${pageable.pageSize}"
     }
 }
 ```
@@ -1016,6 +1068,8 @@ class UserService(
 @Service
 class LikeService(
     private val likeRepository: LikeRepository,
+    private val productRepository: ProductRepository,
+    private val redisTemplate: RedisTemplate<String, String>,
 ) {
     fun addLike(userId: Long, productId: Long) {
         // 멱등성: 이미 존재하면 저장하지 않음
@@ -1023,13 +1077,44 @@ class LikeService(
             return
         }
 
+        // 상품 조회 및 좋아요 수 증가
+        val product = productRepository.findById(productId)
+            ?: throw CoreException(ErrorType.NOT_FOUND, "상품을 찾을 수 없습니다")
+        product.incrementLikeCount()
+
         val like = Like(userId = userId, productId = productId)
         likeRepository.save(like)
+
+        // 캐시 무효화
+        evictProductCache(productId)
     }
 
     fun removeLike(userId: Long, productId: Long) {
         // 멱등성: 없어도 성공
+        if (!likeRepository.existsByUserIdAndProductId(userId, productId)) {
+            return
+        }
+
+        // 상품 조회 및 좋아요 수 감소
+        val product = productRepository.findById(productId)
+            ?: throw CoreException(ErrorType.NOT_FOUND, "상품을 찾을 수 없습니다")
+        product.decrementLikeCount()
+
         likeRepository.deleteByUserIdAndProductId(userId, productId)
+
+        // 캐시 무효화
+        evictProductCache(productId)
+    }
+
+    private fun evictProductCache(productId: Long) {
+        // 상품 상세 캐시 삭제
+        redisTemplate.delete("product:detail:$productId")
+
+        // 상품 목록 캐시 전체 삭제 (좋아요 순위 변경)
+        val keys = redisTemplate.keys("product:list:*")
+        if (keys.isNotEmpty()) {
+            redisTemplate.delete(keys)
+        }
     }
 }
 ```
