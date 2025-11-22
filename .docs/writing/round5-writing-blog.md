@@ -587,7 +587,7 @@ Product.likeCount와 Like 테이블의 count가 **항상 일치한다고 보장�
 
 1. 주기적으로 **배치 작업**으로 likeCount 재계산
 2. **이벤트 소싱**으로 일관성 보장
-3. **Materialized View** 활용 (PostgreSQL)
+3. **Materialized View** 활용
 
 지금은 "좋아요 수가 1-2개 차이나는 것보다 빠른 응답이 중요"하다고 판단했다.
 
@@ -622,7 +622,7 @@ Product.likeCount와 Like 테이블의 count가 **항상 일치한다고 보장�
 
 ### 1. Materialized View
 
-PostgreSQL의 Materialized View를 사용하면 **쿼리 결과를 물리적으로 저장**할 수 있다.
+Materialized View를 사용하면 **쿼리 결과를 물리적으로 저장**할 수 있다.
 
 ```sql
 CREATE MATERIALIZED VIEW product_with_like_count AS
