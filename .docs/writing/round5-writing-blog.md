@@ -655,15 +655,36 @@ class ProductLikeCountService(
         )
 
         /**
-         * Redis에서 원자적으로 감소하되 0 이하로 내려가지 않도록 하는 Lua 스크립트
+         * Redis에서 원자적으로 감소하되 0 이하로 내려가지 않도록 하는 Lua 스크립트 (키가 존재하는 경우)
+         * 반환값: 감소 후의 값, 또는 키가 없으면 -1
          */
         private val DECREMENT_IF_POSITIVE_SCRIPT = RedisScript.of(
             """
             local current = redis.call('GET', KEYS[1])
             if current == false then
-                return 0
+                return -1
             end
             current = tonumber(current)
+            if current <= 0 then
+                return 0
+            end
+            redis.call('DECR', KEYS[1])
+            return current - 1
+            """.trimIndent(),
+            Long::class.java,
+        )
+
+        /**
+         * Redis에서 원자적으로 초기화 후 감소하는 Lua 스크립트
+         * EXISTS를 통해 키가 없을 때만 SET하여 동시성 경합 조건을 방지합니다.
+         */
+        private val INIT_AND_DECREMENT_IF_POSITIVE_SCRIPT = RedisScript.of(
+            """
+            local exists = redis.call('EXISTS', KEYS[1])
+            if exists == 0 then
+                redis.call('SET', KEYS[1], ARGV[1])
+            end
+            local current = tonumber(redis.call('GET', KEYS[1]))
             if current <= 0 then
                 return 0
             end
@@ -699,14 +720,23 @@ class ProductLikeCountService(
     /**
      * 좋아요 수를 원자적으로 감소시킵니다.
      * Lua 스크립트를 사용하여 원자적으로 감소하되 0 이하로 내려가지 않도록 보장합니다.
+     * 키가 없으면 DB에서 초기값을 가져옵니다.
      */
     fun decrement(productId: Long): Long {
         val key = getLikeCountKey(productId)
 
-        // Lua 스크립트를 사용하여 원자적으로 감소 (0 이하로 내려가지 않음)
+        // 1단계: 키가 존재하면 바로 감소 (대부분의 경우)
+        val result = redisTemplate.execute(DECREMENT_IF_POSITIVE_SCRIPT, listOf(key))
+        if (result != null && result != -1L) {
+            return result
+        }
+
+        // 2단계: 키가 없으면 DB에서 초기값을 가져와 초기화 후 감소
+        val initialValue = productRepository.findById(productId)?.likeCount ?: 0L
         return redisTemplate.execute(
-            DECREMENT_IF_POSITIVE_SCRIPT,
+            INIT_AND_DECREMENT_IF_POSITIVE_SCRIPT,
             listOf(key),
+            initialValue.toString(),
         ) ?: 0L
     }
 }
@@ -873,6 +903,132 @@ fun findByIdWithLock(@Param("id") id: Long): Product?
 "실시간성이 필요한가?"를 먼저 물어야 한다.
 
 좋아요 수는 1-2개 차이는 유저가 신경 쓰지 않는다. 하지만 1초 걸리는 페이지는 바로 느낀다.
+
+### 추가 개선: 동시성 이슈 완전 해결
+
+초기 구현에서는 몇 가지 동시성 이슈가 남아있었다:
+
+**문제 1: `initializeFromDatabase`의 경합 조건**
+
+여러 스레드가 동시에 Redis 키를 초기화하면 나중 스레드가 먼저 증가된 값을 덮어쓸 수 있었다:
+
+```kotlin
+// 문제가 있는 초기 구현
+private fun initializeFromDatabase(productId: Long, key: String): Long {
+    val likeCount = getFromDatabase(productId)
+    redisTemplate.opsForValue().set(key, likeCount.toString())  // 무조건 덮어씀 ❌
+    return likeCount
+}
+```
+
+**시나리오:**
+```
+Thread A: DB에서 likeCount = 5 읽음
+Thread B: DB에서 likeCount = 5 읽음, Redis에 SET하고 INCR → 6
+Thread A: Redis에 SET (5로 덮어씀) ❌
+→ 결과: Thread B의 증가가 손실됨
+```
+
+**해결: `setIfAbsent` 사용**
+
+```kotlin
+// 개선된 구현
+private fun initializeFromDatabase(productId: Long, key: String): Long {
+    val likeCount = getFromDatabase(productId)
+    redisTemplate.opsForValue().setIfAbsent(key, likeCount.toString())  // 키가 없을 때만 설정 ✅
+    return redisTemplate.opsForValue().get(key)?.toLongOrNull() ?: likeCount
+}
+```
+
+이제 먼저 도착한 스레드만 키를 설정하고, 나중 스레드는 이미 설정된 값을 사용한다.
+
+**문제 2: `decrement`에서 첫 unlike 이벤트 손실**
+
+Redis 키가 없을 때 `decrement`를 호출하면 0을 반환하여 첫 번째 unlike 이벤트가 무시되었다:
+
+```kotlin
+// 문제가 있는 초기 구현
+private val DECREMENT_IF_POSITIVE_SCRIPT = RedisScript.of(
+    """
+    local current = redis.call('GET', KEYS[1])
+    if current == false then
+        return 0  // ❌ DB에 likeCount가 있어도 무시됨
+    end
+    // ...
+    """.trimIndent()
+)
+```
+
+**시나리오:**
+```
+DB: Product(likeCount = 3)
+Redis: 키 없음
+User: Unlike 요청
+→ 결과: 0 반환 (실제로는 3 → 2가 되어야 함) ❌
+```
+
+**해결: `increment`와 동일한 패턴 적용**
+
+```kotlin
+// 개선된 구현
+private val DECREMENT_IF_POSITIVE_SCRIPT = RedisScript.of(
+    """
+    local current = redis.call('GET', KEYS[1])
+    if current == false then
+        return -1  // ✅ 키 없음을 명시적으로 표시
+    end
+    // ...
+    """.trimIndent()
+)
+
+fun decrement(productId: Long): Long {
+    val key = getLikeCountKey(productId)
+
+    // 1단계: 키가 존재하면 바로 감소
+    val result = redisTemplate.execute(DECREMENT_IF_POSITIVE_SCRIPT, listOf(key))
+    if (result != null && result != -1L) {
+        return result
+    }
+
+    // 2단계: 키가 없으면 DB에서 초기화 후 감소 ✅
+    val initialValue = productRepository.findById(productId)?.likeCount ?: 0L
+    return redisTemplate.execute(
+        INIT_AND_DECREMENT_IF_POSITIVE_SCRIPT,
+        listOf(key),
+        initialValue.toString(),
+    ) ?: 0L
+}
+```
+
+이제 `decrement`도 `increment`와 동일하게 키가 없으면 DB에서 초기화 후 감소한다.
+
+**검증: 통합 테스트**
+
+```kotlin
+@Test
+fun decrementShouldInitializeFromDatabaseWhenKeyIsMissing() {
+    // given: DB에 likeCount가 3인 상태, Redis 키 없음
+    product.setLikeCount(3L)
+    assertThat(redisTemplate.hasKey(key)).isFalse()
+
+    // when: 첫 번째 decrement 요청
+    val result = productLikeCountService.decrement(productId)
+
+    // then: DB의 초기값(3)에서 1을 뺀 2가 반환
+    assertThat(result).isEqualTo(2L)
+    assertThat(redisTemplate.opsForValue().get(key)?.toLongOrNull()).isEqualTo(2L)
+}
+```
+
+**개선 효과:**
+
+| 상황 | 개선 전 | 개선 후 |
+|------|---------|---------|
+| 동시 초기화 | 나중 스레드가 증가값 덮어씀 ❌ | `setIfAbsent`로 첫 스레드만 설정 ✅ |
+| 첫 unlike (키 없음) | 0 반환하여 이벤트 손실 ❌ | DB에서 초기화 후 감소 ✅ |
+| 키 없을 때 동작 | increment만 초기화 가능 | increment/decrement 모두 가능 ✅ |
+
+이제 모든 동시성 이슈가 해결되어 **원자성과 정합성이 완벽히 보장**된다.
 
 ## 한계와 개선 방향
 
