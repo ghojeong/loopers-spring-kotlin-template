@@ -142,19 +142,17 @@ class Product(
     var likeCount: Long = 0L
         protected set
 
-    fun incrementLikeCount() {
-        this.likeCount += 1
-    }
-
-    fun decrementLikeCount() {
-        if (this.likeCount > 0) {
-            this.likeCount -= 1
-        }
+    /**
+     * 좋아요 수를 직접 설정합니다.
+     * 주의: Redis와 DB 동기화 시에만 사용해야 합니다.
+     */
+    internal fun setLikeCount(count: Long) {
+        this.likeCount = maxOf(0, count)
     }
 }
 ```
 
-좋아요 추가 시 likeCount도 함께 업데이트:
+~~좋아요 추가 시 likeCount도 함께 업데이트:~~ *(이 방식은 동시성 문제가 있어 후에 개선됩니다)*
 
 ```kotlin
 @Transactional
@@ -166,7 +164,7 @@ fun addLike(userId: Long, productId: Long) {
     val product = productRepository.findById(productId)
         ?: throw CoreException(ErrorType.NOT_FOUND, "상품을 찾을 수 없습니다")
 
-    product.incrementLikeCount()  // 좋아요 수 증가
+    product.incrementLikeCount()  // ⚠️ 동시성 문제 발생!
 
     val like = Like(userId = userId, productId = productId)
     likeRepository.save(like)
@@ -575,21 +573,212 @@ RedisTemplate을 직접 사용하니:
 
 디버깅할 때, 장애 상황에서, **정확히 알고 있다는 것**은 엄청난 가치가 있다.
 
+## 좋아요 카운트의 동시성 문제
+
+### "어? 좋아요 수가 이상한데?"
+
+성능 최적화를 마치고 뿌듯해하던 중, 테스트 중 이상한 현상을 발견했다.
+
+동시에 여러 명이 같은 상품에 좋아요를 누르면 **likeCount가 정확히 증가하지 않는** 문제였다.
+
+```kotlin
+// 현재 구현 (문제 있음)
+fun incrementLikeCount() {
+    this.likeCount += 1  // Read-Modify-Write 패턴
+}
+```
+
+**시나리오:**
+```
+Thread A: likeCount = 100 읽음
+Thread B: likeCount = 100 읽음
+Thread A: likeCount = 101로 UPDATE
+Thread B: likeCount = 101로 UPDATE (102가 되어야 하는데!)
+→ 결과: 2번의 좋아요가 1번만 반영됨
+```
+
+"성능은 빨라졌는데 정확하지 않으면 무슨 소용이지?"
+
+### Redis Atomic 연산으로 해결
+
+고민 끝에 **Redis의 INCR/DECR 명령어**를 사용하기로 했다.
+
+Redis의 INCR/DECR은 **원자적(atomic) 연산**이다. 동시에 여러 스레드가 호출해도 안전하다.
+
+```kotlin
+@Service
+class ProductLikeCountService(
+    private val redisTemplate: RedisTemplate<String, String>,
+    private val productRepository: ProductRepository,
+) {
+    fun increment(productId: Long): Long {
+        val key = "product:like:count:$productId"
+
+        // Redis INCR - 원자적 연산!
+        return redisTemplate.opsForValue().increment(key) ?: 0L
+    }
+
+    fun decrement(productId: Long): Long {
+        val key = "product:like:count:$productId"
+
+        // 0 이하로 내려가지 않도록 체크
+        val currentCount = getLikeCount(productId)
+        if (currentCount <= 0) {
+            return 0L
+        }
+
+        return redisTemplate.opsForValue().decrement(key)?.coerceAtLeast(0L) ?: 0L
+    }
+}
+```
+
+좋아요 서비스에서 사용:
+
+```kotlin
+@Transactional
+fun addLike(userId: Long, productId: Long) {
+    if (likeRepository.existsByUserIdAndProductId(userId, productId)) {
+        return
+    }
+
+    if (!productRepository.existsById(productId)) {
+        throw CoreException(ErrorType.NOT_FOUND, "상품을 찾을 수 없습니다: $productId")
+    }
+
+    val like = Like(userId = userId, productId = productId)
+    likeRepository.save(like)
+
+    // Redis에서 원자적으로 증가
+    productLikeCountService.increment(productId)
+
+    evictProductCache(productId)
+}
+```
+
+### "그럼 DB는 언제 업데이트하나요?"
+
+**스케줄러로 주기적 동기화:**
+
+```kotlin
+@Component
+class ProductLikeCountSyncScheduler(
+    private val redisTemplate: RedisTemplate<String, String>,
+    private val productRepository: ProductRepository,
+) {
+    @Scheduled(fixedDelay = 300000) // 5분마다
+    @Transactional
+    fun syncLikeCountsToDatabase() {
+        val keys = redisTemplate.keys("product:like:count:*") ?: return
+
+        keys.forEach { key ->
+            val productId = key.removePrefix("product:like:count:").toLongOrNull()
+            val redisCount = redisTemplate.opsForValue().get(key)?.toLongOrNull()
+
+            if (productId != null && redisCount != null) {
+                val product = productRepository.findById(productId)
+                product?.setLikeCount(redisCount)
+                product?.let { productRepository.save(it) }
+            }
+        }
+    }
+}
+```
+
+**데이터 흐름:**
+
+```
+고객이 좋아요 클릭
+  ↓
+Redis INCR (즉시 반영) ← 고객은 실시간으로 최신값 확인 가능
+  ↓
+... 5분 경과 ...
+  ↓
+Scheduler가 Redis → DB 동기화
+```
+
+- **고객 조회**: Redis에서 항상 최신값 (실시간)
+- **DB 반영**: 5분마다 배치 동기화 (지연 허용)
+
+### Redis 장애 시에는?
+
+"Redis가 죽으면 어떻게 하지?"
+
+**비관적 락을 사용한 Fallback 구현:**
+
+```kotlin
+@Transactional
+fun increment(productId: Long): Long {
+    try {
+        // Redis 정상 동작
+        return redisTemplate.opsForValue().increment(key) ?: 0L
+    } catch (e: RedisConnectionFailureException) {
+        logger.warn("Redis 장애, DB fallback 사용")
+        return fallbackToDbIncrement(productId)
+    }
+}
+
+private fun fallbackToDbIncrement(productId: Long): Long {
+    // 비관적 락으로 동시성 보장
+    val product = productRepository.findByIdWithLock(productId)
+        ?: throw IllegalArgumentException("Product not found")
+
+    val newCount = product.likeCount + 1
+    product.setLikeCount(newCount)
+    productRepository.save(product)
+
+    return newCount
+}
+```
+
+**비관적 락 적용:**
+
+```kotlin
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("SELECT p FROM Product p WHERE p.id = :id")
+fun findByIdWithLock(@Param("id") id: Long): Product?
+```
+
+| 상황 | 동작 | 동시성 보장 |
+|------|------|------------|
+| Redis 정상 | INCR/DECR 사용 | ✅ Atomic 연산 |
+| Redis 장애 | DB 비관적 락 사용 | ✅ PESSIMISTIC_WRITE |
+
+### 트레이드오프
+
+**장점:**
+- 🚀 **성능**: Redis 메모리 연산, 매우 빠름
+- ✅ **동시성**: Atomic 연산으로 안전
+- 📊 **확장성**: DB 부하 분산
+- 🛡️ **안정성**: Redis 장애 시 자동 fallback
+
+**단점:**
+- ⏱️ **지연**: DB 반영은 최대 5분 지연
+- 🔧 **복잡도**: 동기화 로직 관리 필요
+- 💾 **의존성**: Redis 인프라 추가
+
+"실시간성이 필요한가?"를 먼저 물어야 한다.
+
+좋아요 수는 1-2개 차이는 유저가 신경 쓰지 않는다. 하지만 1초 걸리는 페이지는 바로 느낀다.
+
 ## 한계와 개선 방향
 
-### 정합성 문제
+### Redis-DB 동기화 지연
 
-Product.likeCount와 Like 테이블의 count가 **항상 일치한다고 보장할 수 없다.**
+Redis와 DB 간에 **최대 5분의 지연**이 있다.
 
-동시성 버그, 네트워크 장애 등으로 어긋날 수 있다.
+이로 인해:
 
-만약 정합성이 중요하다면:
+1. **DB 기반 쿼리**: 좋아요순 정렬은 5분 전 데이터 기준
+2. **분석/리포트**: 실시간 통계는 부정확할 수 있음
+3. **Redis 초기화**: 앱 재시작 시 DB에서 로드
 
-1. 주기적으로 **배치 작업**으로 likeCount 재계산
-2. **이벤트 소싱**으로 일관성 보장
-3. **Materialized View** 활용
+해결 방법:
 
-지금은 "좋아요 수가 1-2개 차이나는 것보다 빠른 응답이 중요"하다고 판단했다.
+- **즉시 동기화 필요 시**: 동기화 API 제공
+- **정확한 통계 필요 시**: 별도 집계 테이블 운영
+- **Redis 캐시 워밍**: 시작 시 인기 상품만 미리 로드
+
+현재는 "5분 지연은 사용자 경험에 큰 영향 없음"으로 판단했다.
 
 ### 인덱스 비용
 
