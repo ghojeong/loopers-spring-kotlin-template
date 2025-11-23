@@ -5,6 +5,7 @@ import com.loopers.domain.product.ProductRepository
 import com.loopers.support.error.CoreException
 import com.loopers.support.error.ErrorType
 import org.springframework.data.redis.core.RedisTemplate
+import org.springframework.data.redis.core.ScanOptions
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 
@@ -51,23 +52,22 @@ class LikeService(
 
     @Transactional
     fun removeLike(userId: Long, productId: Long) {
-        // 좋아요가 존재하는지 확인
-        if (!likeRepository.existsByUserIdAndProductId(userId, productId)) {
-            return
-        }
-
         // 상품 존재 여부 확인
         if (!productRepository.existsById(productId)) {
             throw CoreException(ErrorType.NOT_FOUND, "상품을 찾을 수 없습니다: $productId")
         }
 
-        likeRepository.deleteByUserIdAndProductId(userId, productId)
+        // 삭제 시도 및 삭제된 행 수 확인
+        val deletedCount = likeRepository.deleteByUserIdAndProductId(userId, productId)
 
-        // Redis에서 좋아요 수 감소 (atomic 연산)
-        productLikeCountService.decrement(productId)
+        // 실제로 삭제된 경우에만 Redis 감소 및 캐시 무효화
+        if (deletedCount > 0) {
+            // Redis에서 좋아요 수 감소 (atomic 연산)
+            productLikeCountService.decrement(productId)
 
-        // 캐시 무효화
-        evictProductCache(productId)
+            // 캐시 무효화
+            evictProductCache(productId)
+        }
     }
 
     private fun evictProductCache(productId: Long) {
@@ -75,9 +75,23 @@ class LikeService(
         val detailCacheKey = "$PRODUCT_DETAIL_CACHE_PREFIX$productId"
         redisTemplate.delete(detailCacheKey)
 
-        // 상품 목록 캐시 삭제 (패턴 매칭으로 관련된 모든 목록 캐시 삭제)
+        // 상품 목록 캐시 삭제 (SCAN을 사용하여 비블로킹 방식으로 패턴 매칭)
         val listCachePattern = "$PRODUCT_LIST_CACHE_PREFIX*"
-        val keys = redisTemplate.keys(listCachePattern)
+        val keys = mutableSetOf<String>()
+
+        redisTemplate.execute { connection ->
+            val scanOptions = ScanOptions.scanOptions()
+                .match(listCachePattern)
+                .count(100) // 한 번에 가져올 키 개수 힌트
+                .build()
+
+            connection.scan(scanOptions).use { cursor ->
+                while (cursor.hasNext()) {
+                    keys.add(String(cursor.next()))
+                }
+            }
+        }
+
         if (keys.isNotEmpty()) {
             redisTemplate.delete(keys)
         }
