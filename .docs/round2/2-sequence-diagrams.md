@@ -327,6 +327,7 @@ sequenceDiagram
 
 - 사용자가 상품에 대한 좋아요를 취소하는 흐름
 - 멱등성을 보장
+- 삭제된 행 수 확인 후 Redis 감소 및 캐시 무효화
 
 ```mermaid
 sequenceDiagram
@@ -336,6 +337,8 @@ sequenceDiagram
     participant LikeService
     participant ProductRepository
     participant LikeRepository
+    participant ProductLikeCountService
+    participant RedisTemplate
 
     User->>LikeV1Controller: DELETE /products/{productId}/likes
     Note over LikeV1Controller: [Interfaces Layer]<br/>X-USER-ID 헤더로 사용자 식별
@@ -343,21 +346,34 @@ sequenceDiagram
     LikeV1Controller->>LikeFacade: removeLike(userId, productId)
     Note over LikeFacade: [Application Layer]
 
-    LikeFacade->>ProductRepository: existsById(productId)
-    alt 상품이 존재하지 않음
-        ProductRepository-->>LikeFacade: false
-        LikeFacade-->>LikeV1Controller: ProductNotFoundException
-        LikeV1Controller-->>User: 404 Not Found
-    end
-    ProductRepository-->>LikeFacade: true
-
     LikeFacade->>LikeService: removeLike(userId, productId)
     Note over LikeService: [Domain Service]<br/>멱등성 보장
 
-    LikeService->>LikeRepository: deleteByUserIdAndProductId(userId, productId)
-    Note over LikeRepository: [Domain Interface]<br/>멱등성: 없어도 성공
+    LikeService->>ProductRepository: existsById(productId)
+    alt 상품이 존재하지 않음
+        ProductRepository-->>LikeService: false
+        LikeService-->>LikeFacade: CoreException (NOT_FOUND)
+        LikeFacade-->>LikeV1Controller: 404 Not Found
+        LikeV1Controller-->>User: 404 Not Found
+    end
+    ProductRepository-->>LikeService: true
 
-    LikeRepository-->>LikeService: 성공
+    LikeService->>LikeRepository: deleteByUserIdAndProductId(userId, productId)
+    Note over LikeRepository: [Domain Interface]<br/>삭제된 행 수 반환 (Long)
+    LikeRepository-->>LikeService: deletedCount (0 또는 1)
+
+    alt 실제로 삭제된 경우 (deletedCount > 0)
+        LikeService->>ProductLikeCountService: decrement(productId)
+        Note over ProductLikeCountService: Redis Lua 스크립트로<br/>원자적 감소 (0 이하 방지)
+        ProductLikeCountService-->>LikeService: 감소 후 카운트
+
+        LikeService->>RedisTemplate: evictProductCache(productId)
+        Note over RedisTemplate: 상품 상세/목록 캐시 삭제<br/>SCAN 사용 (비블로킹)
+        RedisTemplate-->>LikeService: 캐시 무효화 완료
+    else 삭제된 행이 없는 경우 (deletedCount = 0)
+        Note over LikeService: 멱등성: Redis 감소 및 캐시 무효화 생략
+    end
+
     LikeService-->>LikeFacade: 성공
     LikeFacade-->>LikeV1Controller: 성공
     LikeV1Controller-->>User: 200 OK
@@ -365,12 +381,16 @@ sequenceDiagram
 
 - **레이어별 책임**
   - `LikeV1Controller (Interfaces)`: 사용자 인증, HTTP 요청 처리
-  - `LikeFacade (Application)`: 유스케이스 흐름 조율, 상품 존재 검증
-  - `LikeService (Domain Service)`: 멱등성 보장, 삭제 로직
+  - `LikeFacade (Application)`: 유스케이스 흐름 조율
+  - `LikeService (Domain Service)`: 멱등성 보장, 삭제 후 행 수 확인, Redis 감소 및 캐시 무효화 제어
+  - `ProductLikeCountService (Domain Service)`: Redis 원자적 감소 (Lua 스크립트 사용)
   - `ProductRepository, LikeRepository (Domain Interface)`: Repository 인터페이스
+  - `RedisTemplate`: Redis 캐시 관리 (SCAN 방식 사용)
 - **설계 포인트**
-  - **멱등성 보장**: 이미 취소된 경우에도 에러 없이 성공 응답
-  - **도메인 로직**: 멱등성 처리는 Domain Service에 위치
+  - **멱등성 보장**: 이미 취소된 경우 (deletedCount = 0) Redis 감소 및 캐시 무효화를 생략
+  - **정확한 카운트 관리**: 실제로 삭제된 경우에만 Redis 카운트 감소
+  - **Lua 스크립트 사용**: Redis에서 원자적으로 감소하되 0 이하로 내려가지 않도록 보장
+  - **비블로킹 캐시 무효화**: Redis KEYS 대신 SCAN 사용으로 성능 향상
 
 ## 4. 주문 생성
 

@@ -605,29 +605,109 @@ Thread B: likeCount = 101로 UPDATE (102가 되어야 하는데!)
 
 Redis의 INCR/DECR은 **원자적(atomic) 연산**이다. 동시에 여러 스레드가 호출해도 안전하다.
 
+하지만 단순한 INCR/DECR로는 부족했다:
+- **키가 없을 때**: DB에서 초기값을 가져와야 함
+- **동시 초기화**: 여러 스레드가 동시에 초기화하면 경합 발생
+- **0 이하 방지**: 감소 시 음수가 되면 안 됨
+
+**Lua 스크립트로 원자적 연산 보장:**
+
 ```kotlin
 @Service
 class ProductLikeCountService(
     private val redisTemplate: RedisTemplate<String, String>,
     private val productRepository: ProductRepository,
 ) {
-    fun increment(productId: Long): Long {
-        val key = "product:like:count:$productId"
+    companion object {
+        private const val LIKE_COUNT_KEY_PREFIX = "product:like:count:"
 
-        // Redis INCR - 원자적 연산!
-        return redisTemplate.opsForValue().increment(key) ?: 0L
+        /**
+         * Redis에서 원자적으로 증가하는 Lua 스크립트 (키가 존재하는 경우)
+         * 반환값: 증가 후의 값, 또는 키가 없으면 -1
+         */
+        private val INCREMENT_IF_EXISTS_SCRIPT = RedisScript.of(
+            """
+            local current = redis.call('GET', KEYS[1])
+            if current == false then
+                return -1
+            end
+            redis.call('INCR', KEYS[1])
+            return tonumber(current) + 1
+            """.trimIndent(),
+            Long::class.java,
+        )
+
+        /**
+         * Redis에서 원자적으로 초기화 후 증가하는 Lua 스크립트
+         * EXISTS를 통해 키가 없을 때만 SET하여 동시성 경합 조건을 방지합니다.
+         */
+        private val INIT_AND_INCREMENT_SCRIPT = RedisScript.of(
+            """
+            local exists = redis.call('EXISTS', KEYS[1])
+            if exists == 0 then
+                redis.call('SET', KEYS[1], ARGV[1])
+            end
+            redis.call('INCR', KEYS[1])
+            local result = redis.call('GET', KEYS[1])
+            return tonumber(result)
+            """.trimIndent(),
+            Long::class.java,
+        )
+
+        /**
+         * Redis에서 원자적으로 감소하되 0 이하로 내려가지 않도록 하는 Lua 스크립트
+         */
+        private val DECREMENT_IF_POSITIVE_SCRIPT = RedisScript.of(
+            """
+            local current = redis.call('GET', KEYS[1])
+            if current == false then
+                return 0
+            end
+            current = tonumber(current)
+            if current <= 0 then
+                return 0
+            end
+            redis.call('DECR', KEYS[1])
+            return current - 1
+            """.trimIndent(),
+            Long::class.java,
+        )
     }
 
-    fun decrement(productId: Long): Long {
-        val key = "product:like:count:$productId"
+    /**
+     * 좋아요 수를 원자적으로 증가시킵니다.
+     * Lua 스크립트를 사용하여 원자적으로 증가하며, 키가 없으면 DB에서 초기값을 가져옵니다.
+     */
+    fun increment(productId: Long): Long {
+        val key = getLikeCountKey(productId)
 
-        // 0 이하로 내려가지 않도록 체크
-        val currentCount = getLikeCount(productId)
-        if (currentCount <= 0) {
-            return 0L
+        // 1단계: 키가 존재하면 바로 증가 (대부분의 경우)
+        val result = redisTemplate.execute(INCREMENT_IF_EXISTS_SCRIPT, listOf(key))
+        if (result != null && result != -1L) {
+            return result
         }
 
-        return redisTemplate.opsForValue().decrement(key)?.coerceAtLeast(0L) ?: 0L
+        // 2단계: 키가 없으면 DB에서 초기값을 가져와 초기화 후 증가
+        val initialValue = productRepository.findById(productId)?.likeCount ?: 0L
+        return redisTemplate.execute(
+            INIT_AND_INCREMENT_SCRIPT,
+            listOf(key),
+            initialValue.toString(),
+        ) ?: 0L
+    }
+
+    /**
+     * 좋아요 수를 원자적으로 감소시킵니다.
+     * Lua 스크립트를 사용하여 원자적으로 감소하되 0 이하로 내려가지 않도록 보장합니다.
+     */
+    fun decrement(productId: Long): Long {
+        val key = getLikeCountKey(productId)
+
+        // Lua 스크립트를 사용하여 원자적으로 감소 (0 이하로 내려가지 않음)
+        return redisTemplate.execute(
+            DECREMENT_IF_POSITIVE_SCRIPT,
+            listOf(key),
+        ) ?: 0L
     }
 }
 ```
@@ -648,16 +728,34 @@ fun addLike(userId: Long, productId: Long) {
     val like = Like(userId = userId, productId = productId)
     likeRepository.save(like)
 
-    // Redis에서 원자적으로 증가
+    // Redis에서 원자적으로 증가 (Lua 스크립트 사용)
     productLikeCountService.increment(productId)
 
     evictProductCache(productId)
+}
+
+@Transactional
+fun removeLike(userId: Long, productId: Long) {
+    if (!productRepository.existsById(productId)) {
+        throw CoreException(ErrorType.NOT_FOUND, "상품을 찾을 수 없습니다: $productId")
+    }
+
+    // 삭제 시도 및 삭제된 행 수 확인
+    val deletedCount = likeRepository.deleteByUserIdAndProductId(userId, productId)
+
+    // 실제로 삭제된 경우에만 Redis 감소 및 캐시 무효화
+    if (deletedCount > 0) {
+        // Redis에서 원자적으로 감소 (Lua 스크립트 사용, 0 이하 방지)
+        productLikeCountService.decrement(productId)
+
+        evictProductCache(productId)
+    }
 }
 ```
 
 ### "그럼 DB는 언제 업데이트하나요?"
 
-**스케줄러로 주기적 동기화:**
+**스케줄러로 주기적 동기화 (비관적 락 사용):**
 
 ```kotlin
 @Component
@@ -675,9 +773,12 @@ class ProductLikeCountSyncScheduler(
             val redisCount = redisTemplate.opsForValue().get(key)?.toLongOrNull()
 
             if (productId != null && redisCount != null) {
-                val product = productRepository.findById(productId)
-                product?.setLikeCount(redisCount)
-                product?.let { productRepository.save(it) }
+                // DB 업데이트 (비관적 락 사용)
+                val product = productRepository.findByIdWithLock(productId)
+                if (product != null) {
+                    product.setLikeCount(redisCount)
+                    productRepository.save(product)
+                }
             }
         }
     }
@@ -709,8 +810,21 @@ Scheduler가 Redis → DB 동기화
 @Transactional
 fun increment(productId: Long): Long {
     try {
-        // Redis 정상 동작
-        return redisTemplate.opsForValue().increment(key) ?: 0L
+        val key = getLikeCountKey(productId)
+
+        // 1단계: 키가 존재하면 바로 증가 (대부분의 경우)
+        val result = redisTemplate.execute(INCREMENT_IF_EXISTS_SCRIPT, listOf(key))
+        if (result != null && result != -1L) {
+            return result
+        }
+
+        // 2단계: 키가 없으면 DB에서 초기값을 가져와 초기화 후 증가
+        val initialValue = productRepository.findById(productId)?.likeCount ?: 0L
+        return redisTemplate.execute(
+            INIT_AND_INCREMENT_SCRIPT,
+            listOf(key),
+            initialValue.toString(),
+        ) ?: 0L
     } catch (e: RedisConnectionFailureException) {
         logger.warn("Redis 장애, DB fallback 사용")
         return fallbackToDbIncrement(productId)
