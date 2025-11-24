@@ -340,28 +340,80 @@ fun findProducts(...): Page<Product>
 
 ### 명시적 캐시 구현
 
+**초기에는 RedisTemplate을 직접 사용했습니다:**
+
 ```kotlin
 @Service
 class ProductQueryService(
     private val productRepository: ProductRepository,
     private val stockRepository: StockRepository,
-    private val redisTemplate: RedisTemplate<String, String>,
+    private val redisTemplate: RedisTemplate<String, String>,  // ❌ 직접 사용
     private val objectMapper: ObjectMapper,
 ) {
-    companion object {
-        private const val PRODUCT_DETAIL_CACHE_PREFIX = "product:detail:"
-        private const val PRODUCT_LIST_CACHE_PREFIX = "product:list:"
-        private val PRODUCT_DETAIL_TTL = Duration.ofMinutes(10)
-        private val PRODUCT_LIST_TTL = Duration.ofMinutes(5)
-    }
-
     fun getProductDetail(productId: Long): ProductDetailData {
         val cacheKey = "$PRODUCT_DETAIL_CACHE_PREFIX$productId"
 
-        // 1. Redis에서 먼저 조회
+        // Redis 직접 접근
         val cached = redisTemplate.opsForValue().get(cacheKey)
         if (cached != null) {
             return objectMapper.readValue(cached)
+        }
+
+        // ... DB 조회 및 캐시 저장
+    }
+}
+```
+
+하지만 **Service가 Redis 구현 세부사항에 의존**하는 문제가 있었습니다.
+
+**Repository 패턴으로 리팩토링:**
+
+```kotlin
+// ProductCacheRepository.kt - Redis 작업을 캡슐화
+@Repository
+class ProductCacheRepository(
+    private val redisTemplate: RedisTemplate<String, String>,
+    private val objectMapper: ObjectMapper,
+) {
+    fun <T> get(cacheKey: String, typeReference: TypeReference<T>): T? =
+        runCatching {
+            redisTemplate.opsForValue().get(cacheKey)?.let { cached ->
+                objectMapper.readValue(cached, typeReference)
+            }
+        }.onFailure { e ->
+            logger.error("Failed to read from Redis cache: cacheKey=$cacheKey", e)
+        }.getOrNull()
+
+    fun <T> set(cacheKey: String, data: T, ttl: Duration) {
+        runCatching {
+            val cacheValue = objectMapper.writeValueAsString(data)
+            redisTemplate.opsForValue().set(cacheKey, cacheValue, ttl)
+        }.onFailure { e ->
+            logger.error("Failed to write to Redis cache: cacheKey=$cacheKey", e)
+        }
+    }
+
+    fun buildProductDetailCacheKey(productId: Long): String =
+        "$PRODUCT_DETAIL_CACHE_PREFIX$productId"
+}
+
+// ProductQueryService.kt - Repository를 통한 간접 접근
+@Service
+class ProductQueryService(
+    private val productRepository: ProductRepository,
+    private val stockRepository: StockRepository,
+    private val productCacheRepository: ProductCacheRepository,  // ✅ Repository 사용
+) {
+    fun getProductDetail(productId: Long): ProductDetailData {
+        val cacheKey = productCacheRepository.buildProductDetailCacheKey(productId)
+
+        // 1. Redis에서 먼저 조회 (Repository를 통해)
+        val cached = productCacheRepository.get(
+            cacheKey,
+            object : TypeReference<ProductDetailData>() {}
+        )
+        if (cached != null) {
+            return cached
         }
 
         // 2. DB 조회
@@ -371,14 +423,60 @@ class ProductQueryService(
             ?: throw CoreException(ErrorType.NOT_FOUND, "재고 정보를 찾을 수 없습니다")
         val productDetailData = ProductDetailData(product, stock)
 
-        // 3. Redis에 캐시 저장 (10분 TTL)
-        val cacheValue = objectMapper.writeValueAsString(productDetailData)
-        redisTemplate.opsForValue().set(cacheKey, cacheValue, PRODUCT_DETAIL_TTL)
+        // 3. Redis에 캐시 저장 (Repository를 통해)
+        productCacheRepository.set(cacheKey, productDetailData, PRODUCT_DETAIL_TTL)
 
         return productDetailData
     }
 }
 ```
+
+**Repository 패턴의 장점:**
+
+- **관심사 분리**: Service는 비즈니스 로직에 집중, Redis 세부사항은 Repository가 담당
+- **테스트 용이성**: ProductCacheRepository를 모킹하여 Service 테스트 가능
+- **변경 용이성**: Redis 구현을 변경해도 Service 코드는 변경 불필요
+
+**인터페이스/구현체 분리로 DIP 적용:**
+
+Repository 패턴을 더욱 개선하여 인터페이스와 구현체를 분리했습니다. 이는 **의존성 역전 원칙(DIP, Dependency Inversion Principle)**을 따르는 것입니다.
+
+```kotlin
+// Domain Layer: domain/product/ProductCacheRepository.kt (인터페이스)
+interface ProductCacheRepository {
+    fun <T> get(cacheKey: String, typeReference: TypeReference<T>): T?
+    fun <T> set(cacheKey: String, data: T, ttl: Duration)
+    fun delete(cacheKey: String)
+    fun deleteByPattern(pattern: String)
+    fun buildProductDetailCacheKey(productId: Long): String
+    fun buildProductListCacheKey(brandId: Long?, sort: String, pageNumber: Int, pageSize: Int): String
+    fun getProductListCachePattern(): String
+}
+
+// Infrastructure Layer: infrastructure/product/ProductCacheRepositoryImpl.kt (구현체)
+@Component
+class ProductCacheRepositoryImpl(
+    private val redisTemplate: RedisTemplate<String, String>,
+    private val objectMapper: ObjectMapper,
+) : ProductCacheRepository {
+    override fun <T> get(cacheKey: String, typeReference: TypeReference<T>): T? =
+        runCatching {
+            redisTemplate.opsForValue().get(cacheKey)?.let { cached ->
+                objectMapper.readValue(cached, typeReference)
+            }
+        }.onFailure { e ->
+            logger.error("Failed to read from Redis cache: cacheKey=$cacheKey", e)
+        }.getOrNull()
+    // ... 나머지 구현
+}
+```
+
+**DIP의 장점:**
+
+- **도메인 독립성**: Domain Layer는 Redis 구현 기술에 의존하지 않음
+- **유연한 구현 교체**: Redis를 Memcached나 다른 캐시로 교체해도 Domain Layer는 변경 불필요
+- **테스트 격리**: 인터페이스를 모킹하여 Domain Service를 독립적으로 테스트 가능
+- **명확한 책임**: 인터페이스는 "무엇을" 정의하고, 구현체는 "어떻게"를 정의
 
 이제 **정확히 무슨 일이 일어나는지** 알 수 있다:
 
@@ -419,6 +517,8 @@ private fun buildProductListCacheKey(
 
 좋아요를 추가하면 캐시를 지워야 한다. 안 그러면 **좋아요 수가 업데이트되지 않는다.**
 
+**초기 구현 (RedisTemplate 직접 사용):**
+
 ```kotlin
 @Transactional
 fun addLike(userId: Long, productId: Long) {
@@ -429,12 +529,80 @@ fun addLike(userId: Long, productId: Long) {
 
 private fun evictProductCache(productId: Long) {
     // 상품 상세 캐시 삭제
-    redisTemplate.delete("product:detail:$productId")
+    redisTemplate.delete("product:detail:$productId")  // ❌ 직접 접근
 
-    // 상품 목록 캐시 전체 삭제 (좋아요 순위 변경)
-    val keys = redisTemplate.keys("product:list:*")
+    // 상품 목록 캐시 전체 삭제
+    val keys = redisTemplate.keys("product:list:*")  // ❌ 직접 접근
     if (keys.isNotEmpty()) {
         redisTemplate.delete(keys)
+    }
+}
+```
+
+**Repository 패턴으로 리팩토링:**
+
+```kotlin
+// ProductCacheRepository.kt에 무효화 메서드 추가
+@Repository
+class ProductCacheRepository(/* ... */) {
+    fun delete(cacheKey: String) {
+        redisTemplate.delete(cacheKey)
+    }
+
+    fun deleteByPattern(pattern: String) {
+        val keys = scanKeys(pattern)
+        if (keys.isNotEmpty()) {
+            redisTemplate.delete(keys)
+        }
+    }
+
+    fun buildProductDetailCacheKey(productId: Long): String =
+        "$PRODUCT_DETAIL_CACHE_PREFIX$productId"
+
+    fun getProductListCachePattern(): String =
+        "$PRODUCT_LIST_CACHE_PREFIX*"
+
+    private fun scanKeys(pattern: String): Set<String> {
+        val keys = mutableSetOf<String>()
+        redisTemplate.execute { connection ->
+            val scanOptions = ScanOptions.scanOptions()
+                .match(pattern)
+                .count(100)
+                .build()
+
+            connection.scan(scanOptions).use { cursor ->
+                while (cursor.hasNext()) {
+                    keys.add(String(cursor.next()))
+                }
+            }
+        }
+        return keys
+    }
+}
+
+// LikeService.kt - Repository를 통한 캐시 무효화
+@Service
+class LikeService(
+    private val likeRepository: LikeRepository,
+    private val productRepository: ProductRepository,
+    private val productLikeCountService: ProductLikeCountService,
+    private val productCacheRepository: ProductCacheRepository,  // ✅ Repository 사용
+) {
+    @Transactional
+    fun addLike(userId: Long, productId: Long) {
+        // ... 좋아요 추가 로직 ...
+
+        evictProductCache(productId)  // 캐시 무효화
+    }
+
+    private fun evictProductCache(productId: Long) {
+        // 상품 상세 캐시 삭제 (Repository를 통해)
+        val detailCacheKey = productCacheRepository.buildProductDetailCacheKey(productId)
+        productCacheRepository.delete(detailCacheKey)
+
+        // 상품 목록 캐시 삭제 (Repository를 통해)
+        val listCachePattern = productCacheRepository.getProductListCachePattern()
+        productCacheRepository.deleteByPattern(listCachePattern)
     }
 }
 ```
@@ -610,20 +778,39 @@ Redis의 INCR/DECR은 **원자적(atomic) 연산**이다. 동시에 여러 스�
 - **동시 초기화**: 여러 스레드가 동시에 초기화하면 경합 발생
 - **0 이하 방지**: 감소 시 음수가 되면 안 됨
 
-**Lua 스크립트로 원자적 연산 보장:**
+**Lua 스크립트로 원자적 연산 보장 + Repository 패턴 적용 + DIP:**
+
+먼저 인터페이스와 구현체를 분리하여 DIP를 적용합니다:
 
 ```kotlin
-@Service
-class ProductLikeCountService(
+// Domain Layer: domain/product/ProductLikeCountRedisRepository.kt (인터페이스)
+interface ProductLikeCountRedisRepository {
+    fun incrementIfExists(productId: Long): Long?
+    fun initAndIncrement(productId: Long, initialValue: Long): Long
+    fun decrementIfPositive(productId: Long): Long?
+    fun initAndDecrementIfPositive(productId: Long, initialValue: Long): Long
+    fun get(productId: Long): Long?
+    fun setIfAbsent(productId: Long, value: Long): Boolean
+    fun getAfterSetIfAbsent(productId: Long): Long?
+    fun getAllKeys(): Set<String>?
+    fun extractProductId(key: String): Long?
+
+    companion object {
+        const val KEY_NOT_FOUND = -1L
+    }
+}
+
+// Infrastructure Layer: infrastructure/product/ProductLikeCountRedisRepositoryImpl.kt (구현체)
+@Component
+class ProductLikeCountRedisRepositoryImpl(
     private val redisTemplate: RedisTemplate<String, String>,
-    private val productRepository: ProductRepository,
-) {
+) : ProductLikeCountRedisRepository {
     companion object {
         private const val LIKE_COUNT_KEY_PREFIX = "product:like:count:"
+        const val KEY_NOT_FOUND = -1L
 
         /**
          * Redis에서 원자적으로 증가하는 Lua 스크립트 (키가 존재하는 경우)
-         * 반환값: 증가 후의 값, 또는 키가 없으면 -1
          */
         private val INCREMENT_IF_EXISTS_SCRIPT = RedisScript.of(
             """
@@ -639,7 +826,6 @@ class ProductLikeCountService(
 
         /**
          * Redis에서 원자적으로 초기화 후 증가하는 Lua 스크립트
-         * EXISTS를 통해 키가 없을 때만 SET하여 동시성 경합 조건을 방지합니다.
          */
         private val INIT_AND_INCREMENT_SCRIPT = RedisScript.of(
             """
@@ -654,62 +840,16 @@ class ProductLikeCountService(
             Long::class.java,
         )
 
-        /**
-         * Redis에서 원자적으로 감소하되 0 이하로 내려가지 않도록 하는 Lua 스크립트 (키가 존재하는 경우)
-         * 반환값: 감소 후의 값, 또는 키가 없으면 -1
-         */
-        private val DECREMENT_IF_POSITIVE_SCRIPT = RedisScript.of(
-            """
-            local current = redis.call('GET', KEYS[1])
-            if current == false then
-                return -1
-            end
-            current = tonumber(current)
-            if current <= 0 then
-                return 0
-            end
-            redis.call('DECR', KEYS[1])
-            return current - 1
-            """.trimIndent(),
-            Long::class.java,
-        )
-
-        /**
-         * Redis에서 원자적으로 초기화 후 감소하는 Lua 스크립트
-         * EXISTS를 통해 키가 없을 때만 SET하여 동시성 경합 조건을 방지합니다.
-         */
-        private val INIT_AND_DECREMENT_IF_POSITIVE_SCRIPT = RedisScript.of(
-            """
-            local exists = redis.call('EXISTS', KEYS[1])
-            if exists == 0 then
-                redis.call('SET', KEYS[1], ARGV[1])
-            end
-            local current = tonumber(redis.call('GET', KEYS[1]))
-            if current <= 0 then
-                return 0
-            end
-            redis.call('DECR', KEYS[1])
-            return current - 1
-            """.trimIndent(),
-            Long::class.java,
-        )
+        // ... 다른 Lua 스크립트들 ...
     }
 
-    /**
-     * 좋아요 수를 원자적으로 증가시킵니다.
-     * Lua 스크립트를 사용하여 원자적으로 증가하며, 키가 없으면 DB에서 초기값을 가져옵니다.
-     */
-    fun increment(productId: Long): Long {
-        val key = getLikeCountKey(productId)
+    fun incrementIfExists(productId: Long): Long? {
+        val key = buildKey(productId)
+        return redisTemplate.execute(INCREMENT_IF_EXISTS_SCRIPT, listOf(key))
+    }
 
-        // 1단계: 키가 존재하면 바로 증가 (대부분의 경우)
-        val result = redisTemplate.execute(INCREMENT_IF_EXISTS_SCRIPT, listOf(key))
-        if (result != null && result != -1L) {
-            return result
-        }
-
-        // 2단계: 키가 없으면 DB에서 초기값을 가져와 초기화 후 증가
-        val initialValue = productRepository.findById(productId)?.likeCount ?: 0L
+    fun initAndIncrement(productId: Long, initialValue: Long): Long {
+        val key = buildKey(productId)
         return redisTemplate.execute(
             INIT_AND_INCREMENT_SCRIPT,
             listOf(key),
@@ -717,30 +857,56 @@ class ProductLikeCountService(
         ) ?: 0L
     }
 
+    // ... 다른 메서드들 ...
+
+    private fun buildKey(productId: Long): String = "$LIKE_COUNT_KEY_PREFIX$productId"
+}
+
+// ProductLikeCountService.kt - Repository를 통한 Redis 접근
+@Service
+class ProductLikeCountService(
+    private val productLikeCountRedisRepository: ProductLikeCountRedisRepository,  // ✅ Repository 사용
+    private val productRepository: ProductRepository,
+) {
+    /**
+     * 좋아요 수를 원자적으로 증가시킵니다.
+     */
+    fun increment(productId: Long): Long {
+        // 1단계: 키가 존재하면 바로 증가 (Repository를 통해)
+        val result = productLikeCountRedisRepository.incrementIfExists(productId)
+        if (result != null && result != ProductLikeCountRedisRepository.KEY_NOT_FOUND) {
+            return result
+        }
+
+        // 2단계: 키가 없으면 DB에서 초기값을 가져와 초기화 후 증가
+        val initialValue = productRepository.findById(productId)?.likeCount ?: 0L
+        return productLikeCountRedisRepository.initAndIncrement(productId, initialValue)
+    }
+
     /**
      * 좋아요 수를 원자적으로 감소시킵니다.
-     * Lua 스크립트를 사용하여 원자적으로 감소하되 0 이하로 내려가지 않도록 보장합니다.
-     * 키가 없으면 DB에서 초기값을 가져옵니다.
      */
     fun decrement(productId: Long): Long {
-        val key = getLikeCountKey(productId)
-
-        // 1단계: 키가 존재하면 바로 감소 (대부분의 경우)
-        val result = redisTemplate.execute(DECREMENT_IF_POSITIVE_SCRIPT, listOf(key))
-        if (result != null && result != -1L) {
+        // 1단계: 키가 존재하면 바로 감소 (Repository를 통해)
+        val result = productLikeCountRedisRepository.decrementIfPositive(productId)
+        if (result != null && result != ProductLikeCountRedisRepository.KEY_NOT_FOUND) {
             return result
         }
 
         // 2단계: 키가 없으면 DB에서 초기값을 가져와 초기화 후 감소
         val initialValue = productRepository.findById(productId)?.likeCount ?: 0L
-        return redisTemplate.execute(
-            INIT_AND_DECREMENT_IF_POSITIVE_SCRIPT,
-            listOf(key),
-            initialValue.toString(),
-        ) ?: 0L
+        return productLikeCountRedisRepository.initAndDecrementIfPositive(productId, initialValue)
     }
 }
 ```
+
+**Repository 패턴 + DIP의 장점:**
+
+- **Lua 스크립트 캡슐화**: Redis 세부 구현을 Repository에 격리
+- **테스트 용이성**: ProductLikeCountRedisRepository를 모킹하여 Service 단위 테스트 가능
+- **재사용성**: 다른 Service에서도 동일한 Repository 사용 가능
+- **도메인 독립성**: Domain Layer는 Redis 구현 기술에 의존하지 않음 (인터페이스만 의존)
+- **유연한 구현 교체**: Redis 구현을 다른 기술로 교체해도 Domain Service는 변경 불필요
 
 좋아요 서비스에서 사용:
 

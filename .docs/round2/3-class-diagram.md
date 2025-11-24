@@ -757,6 +757,100 @@ interface LikeRepository {
 }
 ```
 
+### ProductCacheRepository
+
+```kotlin
+// Domain Layer: domain/product/ProductCacheRepository.kt
+interface ProductCacheRepository {
+    fun <T> get(cacheKey: String, typeReference: TypeReference<T>): T?
+    fun <T> set(cacheKey: String, data: T, ttl: Duration)
+    fun delete(cacheKey: String)
+    fun deleteByPattern(pattern: String)
+    fun buildProductDetailCacheKey(productId: Long): String
+    fun buildProductListCacheKey(brandId: Long?, sort: String, pageNumber: Int, pageSize: Int): String
+    fun getProductListCachePattern(): String
+}
+
+// Infrastructure Layer: infrastructure/product/ProductCacheRepositoryImpl.kt
+@Component
+class ProductCacheRepositoryImpl(
+    private val redisTemplate: RedisTemplate<String, String>,
+    private val objectMapper: ObjectMapper,
+) : ProductCacheRepository {
+    override fun <T> get(cacheKey: String, typeReference: TypeReference<T>): T? =
+        runCatching {
+            redisTemplate.opsForValue().get(cacheKey)?.let { cached ->
+                objectMapper.readValue(cached, typeReference)
+            }
+        }.onFailure { e ->
+            logger.error("Failed to read from Redis cache: cacheKey=$cacheKey", e)
+        }.getOrNull()
+
+    override fun <T> set(cacheKey: String, data: T, ttl: Duration) {
+        runCatching {
+            val cacheValue = objectMapper.writeValueAsString(data)
+            redisTemplate.opsForValue().set(cacheKey, cacheValue, ttl)
+        }.onFailure { e ->
+            logger.error("Failed to write to Redis cache: cacheKey=$cacheKey", e)
+        }
+    }
+    // ... 기타 메서드들
+}
+```
+
+### ProductLikeCountRedisRepository
+
+```kotlin
+// Domain Layer: domain/product/ProductLikeCountRedisRepository.kt
+interface ProductLikeCountRedisRepository {
+    fun incrementIfExists(productId: Long): Long?
+    fun initAndIncrement(productId: Long, initialValue: Long): Long
+    fun decrementIfPositive(productId: Long): Long?
+    fun initAndDecrementIfPositive(productId: Long, initialValue: Long): Long
+    fun get(productId: Long): Long?
+    fun setIfAbsent(productId: Long, value: Long): Boolean
+    fun getAfterSetIfAbsent(productId: Long): Long?
+    fun getAllKeys(): Set<String>?
+    fun extractProductId(key: String): Long?
+
+    companion object {
+        const val KEY_NOT_FOUND = -1L
+    }
+}
+
+// Infrastructure Layer: infrastructure/product/ProductLikeCountRedisRepositoryImpl.kt
+@Component
+class ProductLikeCountRedisRepositoryImpl(
+    private val redisTemplate: RedisTemplate<String, String>,
+) : ProductLikeCountRedisRepository {
+    companion object {
+        private const val LIKE_COUNT_KEY_PREFIX = "product:like:count:"
+
+        // Lua 스크립트들 (원자적 연산 보장)
+        private val INCREMENT_IF_EXISTS_SCRIPT = RedisScript.of(
+            """
+            local current = redis.call('GET', KEYS[1])
+            if current == false then
+                return -1
+            end
+            redis.call('INCR', KEYS[1])
+            return tonumber(current) + 1
+            """.trimIndent(),
+            Long::class.java,
+        )
+        // ... 기타 Lua 스크립트들
+    }
+
+    override fun incrementIfExists(productId: Long): Long? {
+        val key = buildKey(productId)
+        return redisTemplate.execute(INCREMENT_IF_EXISTS_SCRIPT, listOf(key))
+    }
+    // ... 기타 메서드들
+
+    private fun buildKey(productId: Long): String = "$LIKE_COUNT_KEY_PREFIX$productId"
+}
+```
+
 ### OrderRepository
 
 ```kotlin
@@ -882,15 +976,11 @@ class ProductQueryService(
     private val productRepository: ProductRepository,
     private val stockRepository: StockRepository,
     private val productLikeCountService: ProductLikeCountService,
-    private val redisTemplate: RedisTemplate<String, String>,
-    private val objectMapper: ObjectMapper,
+    private val productCacheRepository: ProductCacheRepository,  // ✅ Repository 패턴 사용
 ) {
     companion object {
-        private const val PRODUCT_DETAIL_CACHE_PREFIX = "product:detail:"
-        private const val PRODUCT_LIST_CACHE_PREFIX = "product:list:"
         private val PRODUCT_DETAIL_TTL = Duration.ofMinutes(10)
         private val PRODUCT_LIST_TTL = Duration.ofMinutes(5)
-        private val logger = LoggerFactory.getLogger(ProductQueryService::class.java)
     }
 
     data class ProductDetailData(
@@ -899,23 +989,25 @@ class ProductQueryService(
     )
 
     fun findProducts(brandId: Long?, sort: String, pageable: Pageable): Page<Product> {
-        val cacheKey = buildProductListCacheKey(brandId, sort, pageable)
+        val cacheKey = productCacheRepository.buildProductListCacheKey(
+            brandId,
+            sort,
+            pageable.pageNumber,
+            pageable.pageSize,
+        )
 
-        // 1. Redis에서 먼저 조회 (예외 처리로 fallback 보장)
-        try {
-            val cached = redisTemplate.opsForValue().get(cacheKey)
-            if (cached != null) {
-                val products: Page<Product> = objectMapper.readValue(cached)
-                // 캐시된 데이터라도 최신 좋아요 수를 Redis에서 가져와서 반영
-                products.content.forEach { product ->
-                    val likeCount = productLikeCountService.getLikeCount(product.id)
-                    product.setLikeCount(likeCount)
-                }
-                return products
+        // 1. Redis에서 먼저 조회 (Repository를 통해)
+        val cached = productCacheRepository.get(
+            cacheKey,
+            object : TypeReference<Page<Product>>() {}
+        )
+        if (cached != null) {
+            // 캐시된 데이터라도 최신 좋아요 수를 Redis에서 가져와서 반영
+            cached.content.forEach { product ->
+                val likeCount = productLikeCountService.getLikeCount(product.id)
+                product.setLikeCount(likeCount)
             }
-        } catch (e: Exception) {
-            logger.error("Failed to read product list from Redis cache, falling back to DB: cacheKey=$cacheKey", e)
-            // 캐시 실패 시 DB로 fallback
+            return cached
         }
 
         // 2. DB 조회
@@ -927,34 +1019,25 @@ class ProductQueryService(
             product.setLikeCount(likeCount)
         }
 
-        // 4. Redis에 캐시 저장 (5분 TTL, 실패해도 응답에 영향 없음)
-        try {
-            val cacheValue = objectMapper.writeValueAsString(products)
-            redisTemplate.opsForValue().set(cacheKey, cacheValue, PRODUCT_LIST_TTL)
-        } catch (e: Exception) {
-            logger.error("Failed to write product list to Redis cache: cacheKey=$cacheKey", e)
-            // 캐시 쓰기 실패는 무시하고 계속 진행
-        }
+        // 4. Redis에 캐시 저장 (Repository를 통해)
+        productCacheRepository.set(cacheKey, products, PRODUCT_LIST_TTL)
 
         return products
     }
 
     fun getProductDetail(productId: Long): ProductDetailData {
-        val cacheKey = "$PRODUCT_DETAIL_CACHE_PREFIX$productId"
+        val cacheKey = productCacheRepository.buildProductDetailCacheKey(productId)
 
-        // 1. Redis에서 먼저 조회 (예외 처리로 fallback 보장)
-        try {
-            val cached = redisTemplate.opsForValue().get(cacheKey)
-            if (cached != null) {
-                val productDetailData: ProductDetailData = objectMapper.readValue(cached)
-                // 캐시된 데이터라도 최신 좋아요 수를 Redis에서 가져와서 반영
-                val likeCount = productLikeCountService.getLikeCount(productId)
-                productDetailData.product.setLikeCount(likeCount)
-                return productDetailData
-            }
-        } catch (e: Exception) {
-            logger.error("Failed to read product detail from Redis cache, falling back to DB: productId=$productId", e)
-            // 캐시 실패 시 DB로 fallback
+        // 1. Redis에서 먼저 조회 (Repository를 통해)
+        val cached = productCacheRepository.get(
+            cacheKey,
+            object : TypeReference<ProductDetailData>() {}
+        )
+        if (cached != null) {
+            // 캐시된 데이터라도 최신 좋아요 수를 Redis에서 가져와서 반영
+            val likeCount = productLikeCountService.getLikeCount(productId)
+            cached.product.setLikeCount(likeCount)
+            return cached
         }
 
         // 2. DB 조회
@@ -969,14 +1052,8 @@ class ProductQueryService(
 
         val productDetailData = ProductDetailData(product, stock)
 
-        // 4. Redis에 캐시 저장 (10분 TTL, 실패해도 응답에 영향 없음)
-        try {
-            val cacheValue = objectMapper.writeValueAsString(productDetailData)
-            redisTemplate.opsForValue().set(cacheKey, cacheValue, PRODUCT_DETAIL_TTL)
-        } catch (e: Exception) {
-            logger.error("Failed to write product detail to Redis cache: productId=$productId", e)
-            // 캐시 쓰기 실패는 무시하고 계속 진행
-        }
+        // 4. Redis에 캐시 저장 (Repository를 통해)
+        productCacheRepository.set(cacheKey, productDetailData, PRODUCT_DETAIL_TTL)
 
         return productDetailData
     }
@@ -984,11 +1061,6 @@ class ProductQueryService(
     fun getProductsByIds(productIds: List<Long>): List<Product> {
         // 삭제되지 않은 상품만 조회 (deletedAt IS NULL)
         return productRepository.findByIdInAndDeletedAtIsNull(productIds)
-    }
-
-    private fun buildProductListCacheKey(brandId: Long?, sort: String, pageable: Pageable): String {
-        val brand = brandId ?: "all"
-        return "${PRODUCT_LIST_CACHE_PREFIX}brand:$brand:sort:$sort:page:${pageable.pageNumber}:size:${pageable.pageSize}"
     }
 }
 ```
@@ -1111,13 +1183,8 @@ class LikeService(
     private val likeRepository: LikeRepository,
     private val productRepository: ProductRepository,
     private val productLikeCountService: ProductLikeCountService,
-    private val redisTemplate: RedisTemplate<String, String>,
+    private val productCacheRepository: ProductCacheRepository,  // ✅ Repository 패턴 사용
 ) {
-    companion object {
-        private const val PRODUCT_DETAIL_CACHE_PREFIX = "product:detail:"
-        private const val PRODUCT_LIST_CACHE_PREFIX = "product:list:"
-    }
-
     fun addLike(userId: Long, productId: Long) {
         // 멱등성: 이미 존재하면 저장하지 않음
         if (likeRepository.existsByUserIdAndProductId(userId, productId)) {
@@ -1135,7 +1202,7 @@ class LikeService(
         // Redis에서 좋아요 수 증가 (Lua 스크립트로 atomic 연산, 동시성 안전)
         productLikeCountService.increment(productId)
 
-        // 캐시 무효화
+        // 캐시 무효화 (Repository를 통해)
         evictProductCache(productId)
     }
 
@@ -1153,36 +1220,19 @@ class LikeService(
             // Redis에서 좋아요 수 감소 (Lua 스크립트로 atomic 연산, 0 이하 방지)
             productLikeCountService.decrement(productId)
 
-            // 캐시 무효화
+            // 캐시 무효화 (Repository를 통해)
             evictProductCache(productId)
         }
     }
 
     private fun evictProductCache(productId: Long) {
-        // 상품 상세 캐시 삭제
-        val detailCacheKey = "$PRODUCT_DETAIL_CACHE_PREFIX$productId"
-        redisTemplate.delete(detailCacheKey)
+        // 상품 상세 캐시 삭제 (Repository를 통해)
+        val detailCacheKey = productCacheRepository.buildProductDetailCacheKey(productId)
+        productCacheRepository.delete(detailCacheKey)
 
-        // 상품 목록 캐시 삭제 (SCAN을 사용하여 비블로킹 방식으로 패턴 매칭)
-        val listCachePattern = "$PRODUCT_LIST_CACHE_PREFIX*"
-        val keys = mutableSetOf<String>()
-
-        redisTemplate.execute { connection ->
-            val scanOptions = ScanOptions.scanOptions()
-                .match(listCachePattern)
-                .count(100) // 한 번에 가져올 키 개수 힌트
-                .build()
-
-            connection.scan(scanOptions).use { cursor ->
-                while (cursor.hasNext()) {
-                    keys.add(String(cursor.next()))
-                }
-            }
-        }
-
-        if (keys.isNotEmpty()) {
-            redisTemplate.delete(keys)
-        }
+        // 상품 목록 캐시 삭제 (Repository를 통해)
+        val listCachePattern = productCacheRepository.getProductListCachePattern()
+        productCacheRepository.deleteByPattern(listCachePattern)
     }
 }
 ```
@@ -1249,14 +1299,17 @@ src/main/kotlin/
 │   │   ├── BrandRepository.kt         # Interface
 │   │   └── BrandQueryService.kt       # Query Service
 │   ├── product/
-│   │   ├── Product.kt                 # Entity
-│   │   ├── Price.kt                   # Value Object
-│   │   ├── Stock.kt                   # Entity
-│   │   ├── Currency.kt                # Enum
-│   │   ├── ProductRepository.kt       # Interface
-│   │   ├── StockRepository.kt         # Interface
-│   │   ├── ProductQueryService.kt     # Query Service
-│   │   └── StockService.kt            # Domain Service
+│   │   ├── Product.kt                           # Entity
+│   │   ├── Price.kt                             # Value Object
+│   │   ├── Stock.kt                             # Entity
+│   │   ├── Currency.kt                          # Enum
+│   │   ├── ProductRepository.kt                 # Interface
+│   │   ├── StockRepository.kt                   # Interface
+│   │   ├── ProductCacheRepository.kt            # Interface (Redis 캐시)
+│   │   ├── ProductLikeCountRedisRepository.kt   # Interface (Redis 좋아요 카운트)
+│   │   ├── ProductQueryService.kt               # Query Service
+│   │   ├── ProductLikeCountService.kt           # Domain Service
+│   │   └── StockService.kt                      # Domain Service
 │   ├── like/
 │   │   ├── Like.kt                    # Entity
 │   │   ├── LikeRepository.kt          # Interface
@@ -1281,7 +1334,9 @@ src/main/kotlin/
     │   ├── ProductRepositoryImpl.kt
     │   ├── ProductJpaRepository.kt
     │   ├── StockRepositoryImpl.kt
-    │   └── StockJpaRepository.kt
+    │   ├── StockJpaRepository.kt
+    │   ├── ProductCacheRepositoryImpl.kt       # Redis 캐시 구현체
+    │   └── ProductLikeCountRedisRepositoryImpl.kt  # Redis 좋아요 카운트 구현체
     ├── like/
     │   ├── LikeRepositoryImpl.kt
     │   └── LikeJpaRepository.kt
