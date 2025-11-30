@@ -36,7 +36,7 @@
 | POST | `/api/v1/points/charge` | 포인트 충전 |
 | GET | `/api/v1/points` | 보유 포인트 조회 |
 
-- 이 시스템은 실제 결제(PG) 대신, 사전 충전된 포인트로 상품을 결제합니다.
+- 포인트는 주문 시 결제 수단 중 하나로 사용됩니다.
 - 포인트 사용은 주문 과정에서 자동으로 처리되며, 별도의 사용 API는 제공되지 않습니다.
 
 ## 브랜드 & 상품 (Brands / Products)
@@ -73,15 +73,18 @@
 - **상품에 대한 **좋아요 추가/해제** 기능은 멱등하게 동작하여야 합니다.
 - 상품 목록, 상품 상세 정보 조회 시 **총 좋아요 수**를 표기해야 합니다.
 
-## 주문 / 결제 (Orders)
+## 주문 / 결제 (Orders & Payments)
 
 | **METHOD** | **URI** | **설명** |
 | --- | --- | --- |
 | POST | `/api/v1/orders` | 주문 요청 |
 | GET | `/api/v1/orders` | 유저의 주문 목록 조회 |
 | GET | `/api/v1/orders/{orderId}` | 단일 주문 상세 조회 |
+| POST | `/api/v1/payments/card` | 카드 결제 요청 |
+| POST | `/api/v1/payments/callback` | PG 콜백 처리 |
+| GET | `/api/v1/payments/{transactionKey}` | 결제 정보 조회 |
 
-**요청 예시:**
+**주문 요청 예시:**
 
 ```json
 {
@@ -89,15 +92,20 @@
     { "productId": 1, "quantity": 2 },
     { "productId": 3, "quantity": 1 }
   ],
-  "couponId": 123
+  "couponId": 123,
+  "paymentMethod": "CARD",
+  "cardType": "SAMSUNG",
+  "cardNo": "1234-5678-9012-3456"
 }
 ```
 
 - 주문 시 필요한 처리
   - 상품 재고 확인 및 차감
   - 쿠폰 적용 및 할인 금액 계산 (선택적)
-  - 포인트 확인 및 차감
-  - 주문 정보 외부 시스템 전송 **(Mock 처리 가능)**
+  - **결제 방식 선택 (POINT 또는 CARD)**
+  - **POINT 결제**: 포인트 확인 및 차감
+  - **CARD 결제**: PG 연동을 통한 카드 결제 요청
+  - **Resilience 패턴**: Timeout, Retry, Circuit Breaker, Fallback 적용
 
 ### 나아가며
 

@@ -702,3 +702,221 @@ sequenceDiagram
 - N+1 문제 고려 (좋아요 수 집계)
 - 읽기 전용 작업은 별도 Query Service로 분리 (`ProductQueryService`)
 - 비관적 락의 범위 최소화로 성능 확보
+
+## 6. 카드 결제 요청 (CARD Payment)
+
+- 사용자가 카드로 결제하는 흐름
+- PG 연동을 통한 비동기 결제 처리
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant OrderV1Controller
+    participant OrderFacade
+    participant StockService
+    participant OrderService
+    participant PaymentFacade
+    participant PaymentService
+    participant PgClient
+
+    User->>OrderV1Controller: POST /orders {items, paymentMethod: "CARD", cardType, cardNo}
+    Note over OrderV1Controller: [Interfaces Layer]<br/>X-USER-ID 헤더 검증
+
+    OrderV1Controller->>OrderFacade: createOrder(userId, request)
+    Note over OrderFacade: [Application Layer]<br/>@Transactional
+
+    Note over OrderFacade: 1. 상품 및 재고 검증 (생략)
+
+    Note over OrderFacade: 2. 재고 차감 (정렬된 순서)
+    loop 각 주문 항목
+        OrderFacade->>StockService: decreaseStock(productId, quantity)
+        Note over StockService: findByProductIdWithLock<br/>(PESSIMISTIC_WRITE)
+        StockService-->>OrderFacade: Stock (updated)
+    end
+
+    Note over OrderFacade: 3. 주문 생성
+    OrderFacade->>OrderService: createOrder(userId, orderItems)
+    Note over OrderService: Order Entity 생성 및 저장
+    OrderService-->>OrderFacade: Order (status = PENDING)
+
+    Note over OrderFacade: 4. 카드 결제 요청
+    OrderFacade->>PaymentFacade: requestCardPayment(paymentRequest)
+    Note over PaymentFacade: [Application Layer]
+
+    PaymentFacade->>PaymentService: createPayment(userId, orderId, amount, cardType, cardNo)
+    Note over PaymentService: Payment Entity 생성<br/>(status = PENDING)
+    PaymentService-->>PaymentFacade: Payment
+
+    PaymentFacade->>PaymentService: requestPgPayment(payment)
+    Note over PaymentService: [Domain Service]<br/>@Retry, @CircuitBreaker
+
+    PaymentService->>PgClient: requestPayment(request)
+    Note over PgClient: [Infrastructure - Feign]<br/>Timeout: 1s connect, 3s read
+
+    alt PG 요청 성공
+        PgClient-->>PaymentService: PgTransactionResponse (transactionKey, status: PENDING)
+        Note over PaymentService: Payment.updateTransactionKey()
+        PaymentService-->>PaymentFacade: transactionKey
+        PaymentFacade-->>OrderFacade: PaymentInfo (status = PENDING)
+        OrderFacade-->>OrderV1Controller: OrderCreateInfo
+        OrderV1Controller-->>User: 200 OK (주문 완료, 결제 PENDING)
+
+        Note over User,PgClient: === PG가 비동기로 결제 처리 ===
+    else PG 요청 실패 (Retry 후)
+        PgClient-->>PaymentService: Exception (Timeout, Network Error)
+        Note over PaymentService: Retry 3회 실행<br/>(1s, 2s, 4s 간격)
+        alt Retry 실패 후 Circuit Breaker 열림
+            PaymentService-->>PaymentFacade: Fallback 실행
+            Note over PaymentFacade: 재고 복구 필요
+            PaymentFacade->>StockService: increaseStock(productId, quantity)
+            PaymentFacade-->>OrderV1Controller: CoreException (PG 연동 실패)
+            OrderV1Controller-->>User: 500 Internal Error
+        end
+    end
+```
+
+- **레이어별 책임**
+  - `OrderV1Controller (Interfaces)`: HTTP 요청 검증 및 응답 변환
+  - `OrderFacade (Application)`: 주문 생성 흐름 조율, 결제 방식 분기 처리, 재고 복구
+  - `PaymentFacade (Application)`: 결제 요청 흐름 조율
+  - `PaymentService (Domain Service)`: PG 연동 로직, Resilience4j 패턴 적용
+  - `PgClient (Infrastructure)`: Feign Client를 통한 PG API 호출, Timeout 설정
+  - `StockService (Domain Service)`: 재고 차감 및 복구
+  - `OrderService (Domain Service)`: 주문 생성
+- **설계 포인트**
+  - **비동기 결제**: 주문 생성 후 PG 요청, PENDING 상태로 반환
+  - **Resilience 패턴**: `@Retry`, `@CircuitBreaker`, Fallback 적용
+  - **재고 복구**: PG 요청 실패 시 차감한 재고 복구
+  - **트랜잭션 분리**: PG 요청은 트랜잭션 외부에서 처리
+
+## 7. PG 콜백 처리
+
+- PG가 결제 처리 완료 후 시스템에 결과를 전달하는 흐름
+
+```mermaid
+sequenceDiagram
+    participant PG
+    participant PaymentV1Controller
+    participant PaymentFacade
+    participant PaymentService
+    participant PaymentRepository
+    participant Payment
+
+    PG->>PaymentV1Controller: POST /api/v1/payments/callback {transactionKey, status, reason}
+    Note over PaymentV1Controller: [Interfaces Layer]<br/>PG로부터 Callback 수신
+
+    PaymentV1Controller->>PaymentFacade: handleCallback(request)
+    Note over PaymentFacade: [Application Layer]<br/>@Transactional
+
+    PaymentFacade->>PaymentService: handlePaymentCallback(transactionKey, status, reason)
+    Note over PaymentService: [Domain Service]
+
+    PaymentService->>PaymentRepository: findByTransactionKey(transactionKey)
+    Note over PaymentRepository: [Domain Interface]
+
+    alt Payment 존재하지 않음
+        PaymentRepository-->>PaymentService: null
+        PaymentService-->>PaymentFacade: CoreException (Payment not found)
+        PaymentFacade-->>PaymentV1Controller: 404 Not Found
+        PaymentV1Controller-->>PG: 404 Not Found
+    end
+
+    PaymentRepository-->>PaymentService: Payment (current status)
+
+    PaymentService->>Payment: complete() or fail(reason)
+    Note over Payment: [Domain Entity]<br/>상태 업데이트<br/>(PENDING → COMPLETED/FAILED)
+
+    alt 이미 처리된 경우 (멱등성)
+        Payment-->>PaymentService: 상태 변경 없음
+        Note over PaymentService: 멱등성: 이미 완료된 경우<br/>중복 처리하지 않음
+    else 상태 업데이트 성공
+        Payment-->>PaymentService: 상태 업데이트됨
+        PaymentService->>PaymentRepository: save(payment)
+        PaymentRepository-->>PaymentService: Payment (updated)
+    end
+
+    PaymentService-->>PaymentFacade: Payment
+    PaymentFacade-->>PaymentV1Controller: 성공
+    PaymentV1Controller-->>PG: 200 OK
+```
+
+- **레이어별 책임**
+  - `PaymentV1Controller (Interfaces)`: PG Callback 수신 및 응답
+  - `PaymentFacade (Application)`: 콜백 처리 흐름 조율, 트랜잭션 경계
+  - `PaymentService (Domain Service)`: 결제 상태 업데이트 로직
+  - `Payment (Domain Entity)`: 상태 전이 메서드 (`complete()`, `fail()`)
+  - `PaymentRepository (Domain Interface)`: 결제 정보 조회/저장
+- **설계 포인트**
+  - **멱등성**: 동일한 Callback 중복 호출 시에도 안전
+  - **트랜잭션**: Callback 처리는 트랜잭션 내에서 수행
+  - **상태 전이**: Payment Entity가 상태 변경 로직 보유
+
+## 8. 결제 상태 확인 스케줄러
+
+- 5분마다 PENDING 상태 결제를 확인하고 동기화하는 흐름
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant PaymentService
+    participant PaymentRepository
+    participant PgClient
+    participant Payment
+
+    Note over Scheduler: [Infrastructure]<br/>@Scheduled(fixedDelay = 300000)
+
+    Scheduler->>PaymentService: checkPendingPayments()
+    Note over PaymentService: [Domain Service]
+
+    PaymentService->>PaymentRepository: findPendingPaymentsOlderThan(minutes = 10)
+    Note over PaymentRepository: SELECT * FROM payments<br/>WHERE status = 'PENDING'<br/>AND created_at < NOW() - 10 minutes
+
+    PaymentRepository-->>PaymentService: List<Payment> (PENDING, > 10분)
+
+    loop 각 PENDING 결제
+        alt transactionKey 존재
+            PaymentService->>PgClient: getTransaction(transactionKey)
+            Note over PgClient: [Infrastructure - Feign]<br/>PG 상태 조회 API 호출
+
+            alt PG 조회 성공
+                PgClient-->>PaymentService: PgTransactionResponse (status)
+
+                alt PG 상태: SUCCESS
+                    PaymentService->>Payment: complete()
+                    Note over Payment: status = COMPLETED
+                else PG 상태: FAILED
+                    PaymentService->>Payment: fail(reason)
+                    Note over Payment: status = FAILED
+                else PG 상태: PENDING
+                    Note over PaymentService: 계속 대기 (상태 유지)
+                end
+
+                PaymentService->>PaymentRepository: save(payment)
+            else PG 조회 실패
+                PgClient-->>PaymentService: Exception
+
+                PaymentService->>Payment: timeout()
+                Note over Payment: status = TIMEOUT
+                PaymentService->>PaymentRepository: save(payment)
+            end
+        else transactionKey 없음
+            PaymentService->>Payment: timeout()
+            Note over Payment: status = TIMEOUT<br/>(PG 요청 자체가 실패한 경우)
+            PaymentService->>PaymentRepository: save(payment)
+        end
+    end
+
+    PaymentService-->>Scheduler: 완료
+```
+
+- **레이어별 책임**
+  - `PaymentStatusScheduler (Infrastructure)`: 5분마다 스케줄 실행
+  - `PaymentService (Domain Service)`: PENDING 결제 확인 및 상태 동기화
+  - `PgClient (Infrastructure)`: PG 상태 조회 API 호출
+  - `Payment (Domain Entity)`: 상태 전이 메서드 (`complete()`, `fail()`, `timeout()`)
+  - `PaymentRepository (Domain Interface)`: PENDING 결제 조회 및 저장
+- **설계 포인트**
+  - **Callback 유실 대비**: 스케줄러를 통해 능동적으로 상태 확인
+  - **10분 기준**: 생성된 지 10분 이상 PENDING 상태인 결제만 확인
+  - **TIMEOUT 처리**: PG 조회 실패 시 TIMEOUT 상태로 전이
+  - **멱등성**: 이미 처리된 결제는 상태 변경 없음

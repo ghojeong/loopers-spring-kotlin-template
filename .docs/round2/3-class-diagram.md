@@ -157,6 +157,42 @@ classDiagram
         PERCENTAGE
     }
 
+    class Payment {
+        <<Entity>>
+        +Long id
+        +Long userId
+        +Long orderId
+        +Money amount
+        +Currency currency
+        +PaymentStatus status
+        +String transactionKey
+        +String cardType
+        +String cardNo
+        +LocalDateTime createdAt
+        +LocalDateTime updatedAt
+        +isCompleted() boolean
+        +isFailed() boolean
+        +isPending() boolean
+        +complete() void
+        +fail() void
+        +timeout() void
+    }
+
+    class PaymentStatus {
+        <<Enumeration>>
+        PENDING
+        COMPLETED
+        FAILED
+        TIMEOUT
+    }
+
+    class PaymentMethod {
+        <<Enumeration>>
+        POINT
+        CARD
+        MIXED
+    }
+
     Brand "1" --> "*" Product : has
     Product "1" --> "1" Price : contains (VO)
     Product "1" --> "1" Stock : has
@@ -167,11 +203,16 @@ classDiagram
     Point "1" --> "1" Money : contains (VO)
     UserCoupon "*" --> "1" Coupon : references
     Coupon "1" --> "1" CouponType : has
+    Payment "1" --> "1" Order : references
+    Payment "1" --> "1" Money : contains (VO)
+    Payment "1" --> "1" PaymentStatus : has
+    Order "1" --> "1" PaymentMethod : has
 
     note for Order "Aggregate Root: OrderItem은 Order를 통해서만 접근"
     note for Price "Value Object: 불변, 식별자 없음"
     note for Money "Value Object: 불변, 식별자 없음"
     note for UserCoupon "사용자가 소유한 쿠폰, 1회 사용 제한"
+    note for Payment "PG를 통한 카드 결제 정보 관리, 상태 전이 처리"
 ```
 
 ## BaseEntity (모든 엔티티의 기본 클래스)
@@ -478,6 +519,40 @@ abstract class BaseEntity(
   - 1회만 사용 가능 (isUsed 플래그)
   - 동시성 제어 필요 (비관적 락 사용)
 
+### 13. Payment (결제)
+
+- **책임**
+  - PG를 통한 카드 결제 정보 관리
+  - 결제 상태 전이 처리
+  - 결제 결과 추적
+- **속성**
+  - `id`: 결제 고유 식별자
+  - `userId`: 사용자 식별자
+  - `orderId`: 주문 식별자
+  - `amount`: 결제 금액 (Money)
+  - `currency`: 통화 (Currency)
+  - `status`: 결제 상태 (PaymentStatus)
+  - `transactionKey`: PG 거래 고유 키
+  - `cardType`: 카드 종류 (SAMSUNG, SHINHAN 등)
+  - `cardNo`: 카드 번호 (마스킹 처리)
+  - `createdAt`: 결제 생성 일시
+  - `updatedAt`: 결제 수정 일시
+- **메서드**
+  - `isCompleted()`: 결제 완료 여부 확인
+  - `isFailed()`: 결제 실패 여부 확인
+  - `isPending()`: 결제 대기 여부 확인
+  - `complete()`: 결제를 COMPLETED 상태로 전이
+  - `fail()`: 결제를 FAILED 상태로 전이
+  - `timeout()`: 결제를 TIMEOUT 상태로 전이
+- **설계 포인트**
+  - Entity (id로 식별)
+  - Order와 1:1 관계 (한 주문당 하나의 결제)
+  - **비동기 결제 처리**: PENDING → PG 요청 → 콜백 대기 → COMPLETED/FAILED
+  - **멱등성**: 콜백 중복 처리 방지 (transactionKey 기반)
+  - **상태 전이**: PENDING → COMPLETED/FAILED/TIMEOUT
+  - **타임아웃 처리**: 스케줄러가 10분 이상 PENDING 상태인 결제를 확인하여 TIMEOUT 처리
+  - **Resilience 패턴 적용**: PG 호출 시 Timeout, Retry, Circuit Breaker, Fallback 적용
+
 ## Enum 정의
 
 ### Gender (성별)
@@ -520,6 +595,27 @@ enum class CouponType {
 }
 ```
 
+### PaymentStatus (결제 상태)
+
+```kotlin
+enum class PaymentStatus {
+    PENDING,      // 결제 대기 중 (PG 요청 후 콜백 대기)
+    COMPLETED,    // 결제 완료
+    FAILED,       // 결제 실패
+    TIMEOUT       // 결제 타임아웃 (10분 이상 응답 없음)
+}
+```
+
+### PaymentMethod (결제 방식)
+
+```kotlin
+enum class PaymentMethod {
+    POINT,   // 포인트 결제 (동기 처리)
+    CARD,    // 카드 결제 (비동기 PG 처리)
+    MIXED    // 혼합 결제 (향후 구현 예정)
+}
+```
+
 ## 연관 관계 정리
 
 ### 단방향 연관 관계
@@ -533,6 +629,8 @@ enum class CouponType {
 - Point → User: 포인트는 소유자를 알아야 함
 - UserCoupon → User: 사용자 쿠폰은 소유자를 알아야 함
 - UserCoupon → Coupon: 사용자 쿠폰은 쿠폰 정보를 알아야 함
+- Payment → Order: 결제는 주문을 참조함
+- Order → PaymentMethod: 주문은 결제 방식을 알아야 함
 
 ### 양방향 연관 관계 최소화
 
@@ -873,6 +971,36 @@ interface PointRepository {
 }
 ```
 
+### PaymentRepository
+
+```kotlin
+// Domain Layer: domain/payment/PaymentRepository.kt
+interface PaymentRepository {
+    fun findById(id: Long): Payment?
+    fun findByTransactionKey(transactionKey: String): Payment?
+    fun findByOrderId(orderId: Long): Payment?
+    fun findPendingPaymentsOlderThan(timestamp: LocalDateTime): List<Payment>
+    fun save(payment: Payment): Payment
+}
+
+// Infrastructure Layer: infrastructure/payment/PaymentRepositoryImpl.kt
+@Repository
+class PaymentRepositoryImpl(
+    private val jpaRepository: PaymentJpaRepository
+) : PaymentRepository {
+    override fun findById(id: Long): Payment? =
+        jpaRepository.findById(id).orElse(null)
+    override fun findByTransactionKey(transactionKey: String): Payment? =
+        jpaRepository.findByTransactionKey(transactionKey)
+    override fun findByOrderId(orderId: Long): Payment? =
+        jpaRepository.findByOrderId(orderId)
+    override fun findPendingPaymentsOlderThan(timestamp: LocalDateTime): List<Payment> =
+        jpaRepository.findByStatusAndCreatedAtBefore(PaymentStatus.PENDING, timestamp)
+    override fun save(payment: Payment): Payment =
+        jpaRepository.save(payment)
+}
+```
+
 ## Domain Service 설계
 
 Domain Service는 여러 도메인 객체의 협력이 필요한 로직을 처리합니다.
@@ -963,6 +1091,86 @@ class PointService(
             ?: throw CoreException(ErrorType.NOT_FOUND, "포인트 정보를 찾을 수 없습니다: $userId")
         point.charge(amount)
         return pointRepository.save(point)
+    }
+}
+```
+
+### PaymentService
+
+```kotlin
+// Domain Layer: domain/payment/PaymentService.kt
+@Service
+class PaymentService(
+    private val paymentRepository: PaymentRepository,
+) {
+    fun createPayment(
+        userId: Long,
+        orderId: Long,
+        amount: Money,
+        transactionKey: String,
+        cardType: String,
+        cardNo: String,
+    ): Payment {
+        val payment = Payment(
+            userId = userId,
+            orderId = orderId,
+            amount = amount,
+            currency = amount.currency,
+            status = PaymentStatus.PENDING,
+            transactionKey = transactionKey,
+            cardType = cardType,
+            cardNo = cardNo,
+        )
+        return paymentRepository.save(payment)
+    }
+
+    fun completePayment(transactionKey: String): Payment {
+        val payment = paymentRepository.findByTransactionKey(transactionKey)
+            ?: throw CoreException(ErrorType.NOT_FOUND, "결제 정보를 찾을 수 없습니다: $transactionKey")
+
+        // 멱등성: 이미 완료된 경우 그대로 반환
+        if (payment.isCompleted()) {
+            return payment
+        }
+
+        payment.complete()
+        return paymentRepository.save(payment)
+    }
+
+    fun failPayment(transactionKey: String): Payment {
+        val payment = paymentRepository.findByTransactionKey(transactionKey)
+            ?: throw CoreException(ErrorType.NOT_FOUND, "결제 정보를 찾을 수 없습니다: $transactionKey")
+
+        // 멱등성: 이미 실패 처리된 경우 그대로 반환
+        if (payment.isFailed()) {
+            return payment
+        }
+
+        payment.fail()
+        return paymentRepository.save(payment)
+    }
+
+    fun timeoutPayment(paymentId: Long): Payment {
+        val payment = paymentRepository.findById(paymentId)
+            ?: throw CoreException(ErrorType.NOT_FOUND, "결제 정보를 찾을 수 없습니다: $paymentId")
+
+        // PENDING 상태인 경우만 타임아웃 처리
+        if (payment.isPending()) {
+            payment.timeout()
+            return paymentRepository.save(payment)
+        }
+
+        return payment
+    }
+
+    fun getPaymentByTransactionKey(transactionKey: String): Payment {
+        return paymentRepository.findByTransactionKey(transactionKey)
+            ?: throw CoreException(ErrorType.NOT_FOUND, "결제 정보를 찾을 수 없습니다: $transactionKey")
+    }
+
+    fun findPendingPaymentsOlderThan(minutes: Long): List<Payment> {
+        val timestamp = LocalDateTime.now().minusMinutes(minutes)
+        return paymentRepository.findPendingPaymentsOlderThan(timestamp)
     }
 }
 ```
@@ -1259,6 +1467,10 @@ src/main/kotlin/
 │       │   ├── BrandV1Controller.kt
 │       │   ├── BrandV1Dto.kt
 │       │   └── BrandV1ApiSpec.kt
+│       ├── payment/
+│       │   ├── PaymentV1Controller.kt
+│       │   ├── PaymentV1Dto.kt
+│       │   └── PaymentV1ApiSpec.kt
 │       ├── ApiResponse.kt
 │       └── ApiControllerAdvice.kt
 │
@@ -1283,10 +1495,15 @@ src/main/kotlin/
 │   │   ├── UserFacade.kt
 │   │   ├── UserRegisterRequest.kt
 │   │   └── UserInfo.kt
-│   └── point/
-│       ├── PointFacade.kt
-│       ├── PointChargeRequest.kt
-│       └── PointInfo.kt
+│   ├── point/
+│   │   ├── PointFacade.kt
+│   │   ├── PointChargeRequest.kt
+│   │   └── PointInfo.kt
+│   └── payment/
+│       ├── PaymentFacade.kt
+│       ├── CardPaymentRequest.kt
+│       ├── PaymentCallbackRequest.kt
+│       └── PaymentInfo.kt
 │
 ├── domain/                   # Domain Layer (핵심)
 │   ├── user/
@@ -1324,10 +1541,16 @@ src/main/kotlin/
 │   │   ├── OrderRepository.kt         # Interface
 │   │   ├── OrderService.kt            # Domain Service
 │   │   └── OrderQueryService.kt       # Query Service
-│   └── point/
-│       ├── Point.kt                   # Entity
-│       ├── PointRepository.kt         # Interface
-│       └── PointService.kt            # Domain Service
+│   ├── point/
+│   │   ├── Point.kt                   # Entity
+│   │   ├── PointRepository.kt         # Interface
+│   │   └── PointService.kt            # Domain Service
+│   └── payment/
+│       ├── Payment.kt                 # Entity
+│       ├── PaymentStatus.kt           # Enum
+│       ├── PaymentMethod.kt           # Enum
+│       ├── PaymentRepository.kt       # Interface
+│       └── PaymentService.kt          # Domain Service
 │
 └── infrastructure/           # Infrastructure Layer
     ├── product/
@@ -1349,6 +1572,9 @@ src/main/kotlin/
     ├── point/
     │   ├── PointRepositoryImpl.kt
     │   └── PointJpaRepository.kt
+    ├── payment/
+    │   ├── PaymentRepositoryImpl.kt
+    │   └── PaymentJpaRepository.kt
     └── user/
         ├── UserRepositoryImpl.kt
         └── UserJpaRepository.kt

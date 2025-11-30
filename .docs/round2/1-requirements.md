@@ -36,6 +36,8 @@
 | 가격 | Price | 상품의 금액 |
 | 쿠폰 | Coupon | 할인을 제공하는 쿠폰 (정액/정률) |
 | 사용자 쿠폰 | UserCoupon | 사용자가 소유한 쿠폰 (1회 사용 제한) |
+| 결제 | Payment | PG를 통한 결제 정보 |
+| 결제 방식 | PaymentMethod | 결제 수단 (포인트/카드/혼합) |
 
 ## 도메인별 요구사항
 
@@ -273,13 +275,15 @@
   - 로그인한 사용자는 여러 상품을 한 번에 주문할 수 있다.
   - 주문 시 쿠폰을 사용하여 할인을 받을 수 있다 (선택적).
   - 주문 시 재고가 부족하면 주문이 실패한다.
-  - 주문 시 보유 포인트가 부족하면 주문이 실패한다.
-  - 주문 정보는 외부 시스템으로 전송된다.
+  - 주문 시 결제 방식을 선택할 수 있다 (POINT 또는 CARD).
+  - **POINT 결제**: 보유 포인트가 부족하면 주문이 실패한다.
+  - **CARD 결제**: PG를 통해 카드 결제를 요청한다.
 - **기능 흐름**
   - 1. X-USER-ID 헤더로 사용자를 식별한다.
   - 2. 주문 요청을 검증한다.
     - 주문 항목이 1개 이상인지 확인
     - 각 상품의 수량이 1개 이상인지 확인
+    - 결제 방식 검증 (POINT, CARD, MIXED)
   - 3. 각 상품의 재고를 확인한다.
     - 재고가 부족하면 주문 실패 (400 에러)
   - 4. 총 주문 금액을 계산한다.
@@ -287,25 +291,29 @@
     - 쿠폰 사용 가능 여부 확인 및 사용 처리 (비관적 락)
     - 할인 금액 계산
     - 최종 결제 금액 = 주문 금액 - 할인 금액
-  - 6. 사용자의 보유 포인트를 확인한다.
-    - 포인트가 부족하면 주문 실패 (400 에러)
-  - 7. 트랜잭션으로 다음을 처리한다:
-    - 주문 정보 저장
-    - 각 상품의 재고 차감
-    - 사용자 포인트 차감 (할인 적용 후 금액)
-  - 8. 외부 시스템으로 주문 정보를 전송한다 (비동기 또는 Mock 가능).
-  - 9. 주문 결과를 반환한다.
+  - 6. 결제 방식에 따라 처리:
+    - **POINT 결제**:
+      - 사용자의 보유 포인트를 확인한다 (포인트가 부족하면 주문 실패)
+      - 주문 정보 저장
+      - 각 상품의 재고 차감
+      - 사용자 포인트 차감 (할인 적용 후 금액)
+    - **CARD 결제**:
+      - 각 상품의 재고 차감
+      - 주문 정보 저장
+      - PG를 통해 카드 결제 요청 (Resilience4j 패턴 적용)
+      - 결제 실패 시 재고 복구 및 예외 처리
+  - 7. 주문 결과를 반환한다.
 - **제약사항**
   - 재고 차감, 포인트 차감, 주문 저장은 트랜잭션으로 처리
   - 재고 부족 시 명확한 에러 메시지
   - 포인트 부족 시 명확한 에러 메시지
-  - 외부 시스템 연동 실패는 별도 처리 (재시도, 보상 트랜잭션 등)
+  - **PG 연동 실패 처리**: Resilience4j 패턴 적용 (Timeout, Retry, Circuit Breaker, Fallback)
   - 동시성 제어 고려 필요 (재고 차감, 포인트 차감)
 - **예외 상황**
   - 존재하지 않는 상품 주문 시도
   - 재고 부족
   - 포인트 부족
-  - 외부 시스템 연동 실패
+  - **PG 연동 실패**: Timeout, Circuit Breaker 열림, 네트워크 오류
 - **도메인 객체 책임**
   - `Order (Entity, Aggregate Root)`: 주문 정보, OrderItem 집합 관리, 총액 계산 메서드 제공
   - `OrderItem (Entity)`: 주문 항목, 상품 스냅샷(상품명, 브랜드 정보, 가격) 보관
@@ -316,12 +324,14 @@
   - `UserCoupon (Entity)`: 쿠폰 사용 상태 관리 (`canUse()`, `use()`)
   - `OrderService (Domain Service)`: Order, Stock, Point 협력 조율, 트랜잭션 경계
   - `CouponService (Domain Service)`: 쿠폰 사용 로직 (`useUserCoupon()`), 비관적 락을 통한 동시성 제어
-  - `OrderFacade (Application Service)`: 주문 생성 흐름 조율, 쿠폰 적용 및 할인 계산 통합
+  - `OrderFacade (Application Service)`: 주문 생성 흐름 조율, 쿠폰 적용 및 할인 계산 통합, 결제 방식 분기 처리
+  - `PaymentFacade (Application Service)`: 결제 요청 및 콜백 처리
   - `ProductRepository (Interface in Domain)`: 상품 조회
   - `StockRepository (Interface in Domain)`: 재고 조회/수정 (비관적 락)
   - `PointRepository (Interface in Domain)`: 포인트 조회/수정 (비관적 락)
   - `UserCouponRepository (Interface in Domain)`: 사용자 쿠폰 조회/수정 (비관적 락)
   - `OrderRepository (Interface in Domain)`: 주문 저장
+  - `PaymentRepository (Interface in Domain)`: 결제 정보 저장/조회
 
 #### 6.2 주문 목록 조회
 
@@ -354,6 +364,96 @@
   - `Order (Entity, Aggregate Root)`: 주문 소유자 확인 메서드 (`isOwnedBy(userId)`)
   - `OrderRepository (Interface in Domain)`: 주문 ID로 조회 (OrderItem 포함)
 
+### 7. 결제 (Payment)
+
+#### 7.1 결제 도메인
+
+- **유저 스토리**
+  - 사용자는 주문 시 결제 방식을 선택할 수 있다 (POINT 또는 CARD).
+  - 카드 결제는 외부 PG(Payment Gateway)를 통해 처리된다.
+  - 결제 요청은 비동기로 처리되며, 콜백을 통해 결과를 받는다.
+  - 결제 실패 시 재시도 및 장애 대응 패턴이 적용된다.
+- **기능 흐름**
+  - 1. 주문 생성 시 결제 방식을 선택한다.
+  - 2. **POINT 결제**: 동기 처리
+    - 포인트 잔액 확인 및 차감
+    - 트랜잭션 내에서 즉시 완료
+  - 3. **CARD 결제**: 비동기 처리
+    - Payment 엔티티 생성 (status = PENDING)
+    - PG에 결제 요청 (Feign Client 사용)
+    - PG로부터 PENDING 응답 수신
+    - PG가 결제 처리 완료 후 Callback 호출
+    - Callback에서 결제 상태 업데이트 (SUCCESS or FAILED)
+  - 4. **Resilience 패턴 적용**:
+    - **Timeout**: 연결 1초, 응답 3초
+    - **Retry**: 최대 3회, 지수 백오프 (1s, 2s, 4s)
+    - **Circuit Breaker**: 실패율 50% 초과 시 10초간 차단
+    - **Fallback**: 사용자 친화적 에러 메시지
+  - 5. **스케줄러를 통한 상태 확인**:
+    - 5분마다 10분 이상 PENDING 상태인 결제 확인
+    - PG에 상태 조회 후 동기화
+    - 확인 실패 시 TIMEOUT 처리
+- **제약사항**
+  - 결제는 한 번만 시도 가능 (멱등성)
+  - PG 연동 실패 시 재고 복구 필요
+  - Callback 유실 대비 스케줄러 필수
+  - 동시성 제어: 결제 상태 업데이트 시 비관적 락 사용
+- **도메인 객체 책임**
+  - `Payment (Entity)`: 결제 정보, 상태 관리 (`updateTransactionKey()`, `complete()`, `fail()`, `timeout()`)
+  - `PaymentStatus (Enum)`: 결제 상태 (PENDING, COMPLETED, FAILED, TIMEOUT)
+  - `PaymentMethod (Enum)`: 결제 방식 (POINT, CARD, MIXED)
+  - `PaymentService (Domain Service)`: PG 연동 로직, Resilience4j 패턴 적용, 상태 확인 및 동기화
+  - `PaymentFacade (Application Service)`: 결제 요청 및 콜백 처리 흐름 조율
+  - `PaymentRepository (Interface in Domain)`: 결제 정보 저장/조회 인터페이스
+  - `PgClient (Infrastructure)`: Feign Client를 통한 PG API 호출
+  - `PaymentStatusScheduler`: PENDING 결제 상태 확인 및 동기화
+
+#### 7.2 카드 결제 요청
+
+- **유저 스토리**
+  - 사용자는 카드 정보를 입력하여 결제를 요청할 수 있다.
+- **기능 흐름**
+  - 1. 카드 타입 및 카드 번호를 포함하여 결제 요청
+  - 2. Payment 엔티티 생성 (status = PENDING)
+  - 3. PG에 결제 요청 전송
+  - 4. transactionKey 수신 및 저장
+  - 5. 결제 결과 반환 (PENDING 상태)
+- **제약사항**
+  - 카드 정보 필수 (cardType, cardNo)
+  - PG 연동 실패 시 재고 복구
+- **도메인 객체 책임**
+  - `PaymentService (Domain Service)`: PG 결제 요청 (`requestPgPayment()`)
+  - `PaymentFacade (Application Service)`: 결제 요청 흐름 조율
+
+#### 7.3 PG 콜백 처리
+
+- **유저 스토리**
+  - PG가 결제 처리 완료 후 시스템에 결과를 전달한다.
+- **기능 흐름**
+  - 1. PG로부터 Callback 수신 (transactionKey, status, reason 포함)
+  - 2. transactionKey로 Payment 조회
+  - 3. 결제 상태 업데이트 (SUCCESS or FAILED)
+  - 4. 성공 시: Order 상태를 CONFIRMED로 변경
+  - 5. 실패 시: Order 상태는 PENDING 유지 (재시도 가능)
+- **제약사항**
+  - Callback은 중복 호출 가능 (멱등성 보장)
+  - Payment 미존재 시 404 에러
+- **도메인 객체 책임**
+  - `PaymentService (Domain Service)`: 콜백 처리 로직 (`handlePaymentCallback()`)
+  - `PaymentFacade (Application Service)`: 콜백 흐름 조율
+
+#### 7.4 결제 상태 조회
+
+- **유저 스토리**
+  - 사용자는 결제 상태를 조회할 수 있다.
+- **기능 흐름**
+  - 1. transactionKey로 결제 정보 조회
+  - 2. 결제 상태 및 상세 정보 반환
+- **제약사항**
+  - 본인의 결제만 조회 가능
+- **도메인 객체 책임**
+  - `PaymentFacade (Application Service)`: 결제 조회 로직
+
 ## 비기능 요구사항
 
 ### 인증/인가
@@ -382,6 +482,14 @@
 
 - 외부 시스템 연동은 확장 가능하도록 설계
 - 추후 쿠폰, 이벤트 등 기능 추가 고려
+
+### Resilience (장애 대응)
+
+- **Timeout**: 외부 시스템 호출 시 타임아웃 설정 (무한 대기 방지)
+- **Retry**: 일시적 오류 시 재시도 (최대 3회, 지수 백오프)
+- **Circuit Breaker**: 연속 실패 시 일정 시간 요청 차단 (장애 전파 방지)
+- **Fallback**: 장애 발생 시 사용자 친화적 에러 메시지 제공
+- **Scheduler**: PENDING 상태 결제 주기적 확인 및 동기화 (Callback 유실 대비)
 
 ### 소프트 삭제 (Soft Delete)
 

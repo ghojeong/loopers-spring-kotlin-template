@@ -136,6 +136,21 @@ erDiagram
         timestamp deleted_at
     }
 
+    payments {
+        bigint id PK
+        bigint user_id FK
+        bigint order_id FK
+        decimal amount
+        varchar currency
+        varchar status
+        varchar transaction_key UK
+        varchar card_type
+        varchar card_no
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
     users ||--o{ likes : "has"
     products ||--o{ likes : "receives"
     brands ||--o{ products : "has"
@@ -146,6 +161,8 @@ erDiagram
     users ||--|| points : "has"
     users ||--o{ user_coupons : "has"
     coupons ||--o{ user_coupons : "issued to"
+    users ||--o{ payments : "makes"
+    orders ||--|| payments : "has"
 ```
 
 ## 테이블 상세 설명
@@ -436,12 +453,59 @@ erDiagram
   - 사용자 또는 쿠폰 삭제 시 사용자 쿠폰도 함께 삭제 (CASCADE)
   - 소프트 삭제 지원 (`deleted_at`)
 
+### 11. payments (결제)
+
+**도메인 모델 매핑**: `Payment` Entity + `Money` Value Object
+
+PG를 통한 카드 결제 정보를 저장
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 결제 고유 식별자 |
+| user_id | BIGINT | NOT NULL, FK | 사용자 식별자 |
+| order_id | BIGINT | NOT NULL, FK | 주문 식별자 |
+| amount | DECIMAL(15,2) | NOT NULL | 결제 금액 |
+| currency | VARCHAR(3) | NOT NULL, DEFAULT 'KRW' | 통화 단위 |
+| status | VARCHAR(20) | NOT NULL, DEFAULT 'PENDING' | 결제 상태 (PENDING, COMPLETED, FAILED, TIMEOUT) |
+| transaction_key | VARCHAR(255) | NOT NULL, UNIQUE | PG 거래 고유 키 |
+| card_type | VARCHAR(50) | NOT NULL | 카드 종류 (SAMSUNG, SHINHAN 등) |
+| card_no | VARCHAR(255) | NOT NULL | 카드 번호 (마스킹 처리) |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 결제 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - UNIQUE KEY: `transaction_key` (PG 거래 키 중복 방지, 멱등성 보장)
+  - INDEX: `user_id` (사용자별 결제 조회)
+  - INDEX: `order_id` (주문별 결제 조회)
+  - INDEX: `status, created_at` (상태별, 생성 일시 기준 결제 조회)
+- **외래키**
+  - `user_id` REFERENCES `users(id)` ON DELETE RESTRICT
+  - `order_id` REFERENCES `orders(id)` ON DELETE RESTRICT
+- **제약조건**
+  - CHECK: `amount > 0` (결제 금액은 양수)
+  - CHECK: `status IN ('PENDING', 'COMPLETED', 'FAILED', 'TIMEOUT')`
+- **설계 포인트**
+  - **Money VO 매핑**: `amount`, `currency` 컬럼으로 임베드
+    - `Money` VO는 별도 테이블이 아닌 Payment의 컬럼으로 저장
+  - Order와 1:1 관계 (한 주문당 하나의 결제)
+  - **비동기 결제 처리**: PENDING → PG 요청 → 콜백 대기 → COMPLETED/FAILED
+  - **멱등성**: `transaction_key`를 UNIQUE로 설정하여 중복 콜백 방지
+  - **상태 전이**: PENDING → COMPLETED/FAILED/TIMEOUT
+  - **타임아웃 처리**: 스케줄러가 10분 이상 PENDING 상태인 결제를 확인하여 TIMEOUT 처리
+  - 복합 인덱스 `(status, created_at)`로 타임아웃 대상 결제 조회 최적화
+  - 카드 번호는 마스킹 처리하여 저장 (예: 1234-****-****-5678)
+  - 사용자 또는 주문 삭제 시 결제 삭제 방지 (RESTRICT) - 이력 보존
+  - 소프트 삭제 지원 (`deleted_at`)
+
 ## 관계 정리
 
 ### 1:1 관계
 
 - `products` ↔ `stocks`: 상품과 재고는 1:1 관계
 - `users` ↔ `points`: 사용자와 포인트는 1:1 관계
+- `orders` ↔ `payments`: 주문과 결제는 1:1 관계
 
 ### 1:N 관계
 
@@ -453,6 +517,7 @@ erDiagram
 - `products` → `order_items`: 하나의 상품은 여러 주문에 포함될 수 있음
 - `users` → `user_coupons`: 하나의 사용자는 여러 쿠폰을 소유할 수 있음
 - `coupons` → `user_coupons`: 하나의 쿠폰은 여러 사용자에게 발급될 수 있음
+- `users` → `payments`: 하나의 사용자는 여러 결제를 할 수 있음
 
 ### N:M 관계
 
@@ -686,6 +751,28 @@ CREATE TABLE points (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- payments 테이블 생성
+CREATE TABLE payments (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    order_id BIGINT NOT NULL,
+    amount DECIMAL(15,2) NOT NULL CHECK (amount > 0),
+    currency VARCHAR(3) NOT NULL DEFAULT 'KRW',
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'TIMEOUT')),
+    transaction_key VARCHAR(255) NOT NULL UNIQUE,
+    card_type VARCHAR(50) NOT NULL,
+    card_no VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP NULL,
+    INDEX idx_user_id (user_id),
+    INDEX idx_order_id (order_id),
+    INDEX idx_status_created_at (status, created_at),
+    UNIQUE KEY uk_transaction_key (transaction_key),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT,
+    FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE RESTRICT
 );
 ```
 
