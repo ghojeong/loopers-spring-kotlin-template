@@ -1,0 +1,46 @@
+### 카드 결제 요청 (주문 생성 시)
+POST http://localhost:8080/api/v1/orders
+X-USER-ID: 1
+Content-Type: application/json
+
+{
+  "items": [
+    {
+      "productId": 1,
+      "quantity": 2
+    }
+  ],
+  "paymentMethod": "CARD",
+  "cardType": "SAMSUNG",
+  "cardNo": "1234-5678-9012-3456"
+}
+
+### 카드 결제 직접 요청
+POST http://localhost:8080/api/v1/payments/card
+X-USER-ID: 1
+Content-Type: application/json
+
+{
+  "orderId": 1,
+  "amount": 50000,
+  "cardType": "SAMSUNG",
+  "cardNo": "1234-5678-9012-3456"
+}
+
+### 결제 정보 조회 (transactionKey로)
+GET http://localhost:8080/api/v1/payments/20250816:TR:9577c5
+X-USER-ID: 1
+
+### 주문별 결제 목록 조회
+GET http://localhost:8080/api/v1/orders/1/payments
+X-USER-ID: 1
+
+### PG 콜백 시뮬레이션 (수동 테스트용)
+POST http://localhost:8080/api/v1/payments/callback
+Content-Type: application/json
+
+{
+  "transactionKey": "20250816:TR:9577c5",
+  "status": "SUCCESS",
+  "reason": "정상 승인되었습니다."
+}
