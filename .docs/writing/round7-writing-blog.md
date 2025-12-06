@@ -792,6 +792,207 @@ fun handlePaymentFailed(event: PaymentFailedEvent) {
 
 현재 구현은 후자를 선택했다.
 
+### 트랜잭션 안에 숨어있던 위험
+
+주문 확정 로직을 구현하고 나서 안심했다. 별도 트랜잭션으로 분리했고, 동기적으로 실행되어 즉시 반영된다. 완벽해 보였다.
+
+그런데 코드를 다시 보니 문제가 있었다:
+
+**초기 구현:**
+
+```kotlin
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+@EventListener
+fun handlePaymentCompleted(event: PaymentCompletedEvent) {
+    try {
+        val order = orderRepository.findById(event.orderId)
+        order.confirm()
+        orderRepository.save(order)
+
+        logger.info("주문 상태 업데이트 완료: orderId=${event.orderId}")
+
+        // 데이터 플랫폼에 결제 완료 정보 전송
+        dataPlatformClient.sendPaymentCompleted(event)  // ⚠️ 위험!
+
+        // 유저 행동 로깅
+        eventPublisher.publishEvent(UserActionEvent(...))
+    } catch (e: Exception) {
+        logger.error("주문 상태 업데이트 실패: orderId=${event.orderId}", e)
+        throw e
+    }
+}
+```
+
+**"잠깐, 저 외부 API 호출이 트랜잭션 안에 있잖아?"**
+
+### 숨겨진 롤백 위험
+
+만약 데이터 플랫폼 전송이 실패하면 어떻게 될까?
+
+**시나리오:**
+
+```
+1. 결제 완료 이벤트 발행
+   ↓
+2. [주문 확정 트랜잭션 시작]
+   ↓
+3. order.confirm() 성공
+   ↓
+4. orderRepository.save(order) 성공
+   ↓
+5. dataPlatformClient.sendPaymentCompleted() 호출
+   ↓
+6. ❌ 네트워크 타임아웃 발생!
+   ↓
+7. Exception throw
+   ↓
+8. ❌ 트랜잭션 롤백!
+   ↓
+결과: 주문 상태가 다시 PENDING으로...
+```
+
+**문제:**
+
+| 상황 | 결과 | 영향 |
+|------|------|------|
+| 데이터 플랫폼 응답 느림 | 트랜잭션 길어짐 | DB 커넥션 점유 시간 증가 |
+| 네트워크 타임아웃 | Exception 발생 | **주문 확정 롤백** |
+| 데이터 플랫폼 장애 | 전송 실패 | **결제 완료인데 주문은 PENDING** |
+
+**사용자 관점:**
+
+```
+"결제는 완료되었는데 주문 상태가 계속 '대기 중'이에요!"
+"돈은 빠져나갔는데 주문이 확정이 안 돼요!"
+```
+
+**"결제는 성공했는데, 외부 API 장애 때문에 주문이 확정 안 되는 건 말이 안 된다..."**
+
+### 트랜잭션 경계를 다시 그리다
+
+문제의 본질은 **트랜잭션 경계**였다.
+
+**트랜잭션에 포함되어야 하는 것:**
+- ✅ 주문 조회
+- ✅ 주문 상태 변경
+- ✅ 주문 저장
+
+**트랜잭션에 포함되면 안 되는 것:**
+- ❌ 외부 API 호출 (데이터 플랫폼)
+- ❌ 다른 도메인 이벤트 발행 (유저 행동 로깅)
+
+**"외부 호출은 트랜잭션 밖으로!"**
+
+### 해결: 데이터 플랫폼 전송 분리
+
+주문 확정과 데이터 플랫폼 전송을 별도 메서드로 분리했다.
+
+**개선된 구현:**
+
+```kotlin
+// 1. 주문 확정 (트랜잭션)
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+@EventListener
+fun handlePaymentCompleted(event: PaymentCompletedEvent) {
+    try {
+        val order = orderRepository.findById(event.orderId)
+        order.confirm()
+        orderRepository.save(order)
+
+        logger.info("주문 상태 업데이트 완료: orderId=${event.orderId}")
+
+        // 유저 행동 로깅 (같은 트랜잭션)
+        eventPublisher.publishEvent(UserActionEvent(...))
+    } catch (e: Exception) {
+        logger.error("주문 상태 업데이트 실패", e)
+        throw e
+    }
+}
+
+// 2. 데이터 플랫폼 전송 (별도 처리)
+@Async
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+fun handlePaymentCompletedForDataPlatform(event: PaymentCompletedEvent) {
+    try {
+        logger.info("결제 완료 데이터 플랫폼 전송 시작: orderId=${event.orderId}")
+        dataPlatformClient.sendPaymentCompleted(event)
+        logger.info("결제 완료 데이터 플랫폼 전송 완료")
+    } catch (e: Exception) {
+        // 전송 실패해도 주문 확정에는 영향 없음
+        logger.error("결제 완료 데이터 플랫폼 전송 실패: orderId=${event.orderId}", e)
+    }
+}
+```
+
+### 개선 효과
+
+**Before (외부 호출이 트랜잭션 내부):**
+
+```
+[주문 확정 트랜잭션]
+  ├── DB: order.confirm()
+  ├── DB: save(order)
+  ├── 외부 API: dataPlatformClient.send() ⚠️
+  │     └─> 실패 시 전체 롤백!
+  └── 커밋
+```
+
+**After (외부 호출을 트랜잭션 밖으로):**
+
+```
+[주문 확정 트랜잭션]
+  ├── DB: order.confirm()
+  ├── DB: save(order)
+  └── 커밋 ✅
+      ↓
+[데이터 플랫폼 전송] (AFTER_COMMIT, Async)
+  └── 외부 API: dataPlatformClient.send()
+        └─> 실패해도 주문은 이미 확정됨 ✅
+```
+
+**개선 효과:**
+
+| 항목 | Before | After |
+|------|--------|-------|
+| 트랜잭션 시간 | 외부 API 응답 시간 포함 (길어짐) | DB 작업만 (짧아짐) |
+| 외부 장애 영향 | 주문 확정 실패 🔴 | **주문 확정 성공** ✅ |
+| DB 커넥션 점유 | 외부 API 대기 중에도 점유 | 최소 시간만 점유 |
+| 데이터 정합성 | 결제 완료인데 주문 PENDING 가능 | **항상 일관성 유지** ✅ |
+
+**"외부 시스템이 죽어도 우리 핵심 로직은 성공한다!"**
+
+### 트랜잭션 경계의 원칙
+
+이 경험을 통해 배운 트랜잭션 경계 설정 원칙:
+
+**1. 트랜잭션에 포함할 것 (필수):**
+```
+✅ 같은 DB의 데이터 변경
+✅ 원자성이 필요한 작업
+✅ 롤백되어야 하는 작업
+```
+
+**2. 트랜잭션에서 제외할 것 (위험):**
+```
+❌ 외부 API 호출 (HTTP, gRPC 등)
+❌ 메시징 시스템 전송 (Kafka, RabbitMQ)
+❌ 파일 I/O
+❌ 느린 작업
+```
+
+**3. 판단 기준:**
+```
+"이 작업이 실패했을 때,
+ 메인 로직도 롤백되어야 하는가?"
+
+→ YES: 트랜잭션 내부
+→ NO: 트랜잭션 외부 (@TransactionalEventListener + AFTER_COMMIT)
+```
+
+**"주문 확정은 성공해야 하고, 데이터 플랫폼 전송은 실패해도 된다"**
+
+이 명확한 정책이 트랜잭션 경계를 결정했다.
+
 ### 데이터 플랫폼 전송도 분리
 
 결제와 주문 정보를 외부 데이터 플랫폼에 전송하는 것도 이벤트로 분리했다.
