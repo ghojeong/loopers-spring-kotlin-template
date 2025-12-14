@@ -4,24 +4,30 @@
 
 Round 7에서 구현한 ApplicationEvent 기반 이벤트 처리를 Kafka로 확장하여, **서비스 경계를 넘어 안전하게 이벤트를 전달**하는 구조를 구현했습니다.
 
+**애플리케이션 분리:**
+- **commerce-api**: Producer 역할 (Transactional Outbox Pattern)
+- **commerce-streamer**: Consumer 역할 (Idempotent Consumer Pattern)
+
 ### 핵심 구현 사항
 
 **1. Transactional Outbox Pattern (Producer 측 At Least Once 보장)**
-- 도메인 데이터 변경과 이벤트 저장을 하나의 트랜잭션으로 처리
+- commerce-api에서 도메인 데이터 변경과 이벤트 저장을 하나의 트랜잭션으로 처리
 - OutboxRelayScheduler가 주기적으로 PENDING 이벤트를 Kafka로 발행
 - 실패 시 재시도 로직으로 메시지 유실 방지
 
 **2. Idempotent Consumer Pattern (Consumer 측 At Most Once 보장)**
-- EventHandled 테이블로 중복 이벤트 처리 방지
+- commerce-streamer에서 EventHandled 테이블로 중복 이벤트 처리 방지
 - Manual Ack로 처리 완료 후에만 커밋
 - 같은 이벤트가 여러 번 수신되어도 한 번만 처리
 
 **3. Product Metrics 실시간 집계**
-- 좋아요, 조회, 판매량 등을 이벤트 기반으로 집계
-- 도메인 로직과 집계 로직 완전 분리
+- commerce-streamer에서 좋아요, 조회, 판매량 등을 이벤트 기반으로 집계
+- 도메인 로직과 집계 로직 완전 분리 (별도 애플리케이션)
 - 집계 실패해도 도메인 로직에 영향 없음
 
 ### 변경 파일 요약
+
+#### commerce-api (Producer)
 
 ```
 apps/commerce-api/
@@ -33,28 +39,51 @@ apps/commerce-api/
 │   │   │   │   ├── OutboxEvent.kt (Outbox 이벤트 엔티티)
 │   │   │   │   ├── OutboxEventRepository.kt
 │   │   │   │   └── OutboxEventPublisher.kt (트랜잭션 내 이벤트 저장)
-│   │   │   ├── event/
-│   │   │   │   ├── EventHandled.kt (멱등성 보장용 엔티티)
-│   │   │   │   └── EventHandledRepository.kt
-│   │   │   └── product/
-│   │   │       ├── ProductMetrics.kt (집계 메트릭 엔티티)
-│   │   │       └── ProductMetricsRepository.kt
+│   │   │   └── event/
+│   │   │       ├── LikeEvent.kt (이벤트 정의)
+│   │   │       └── OrderEvent.kt (이벤트 정의)
 │   │   └── infrastructure/
-│   │       └── kafka/
-│   │           ├── KafkaConfig.kt (토픽 생성 및 설정)
-│   │           ├── KafkaProducerService.kt (Kafka 메시지 전송)
-│   │           ├── OutboxRelayScheduler.kt (Outbox → Kafka 릴레이)
-│   │           └── KafkaEventConsumer.kt (Consumer + 멱등 처리)
+│   │       ├── kafka/
+│   │       │   ├── KafkaConfig.kt (토픽 생성 및 설정)
+│   │       │   ├── KafkaProducerService.kt (Kafka 메시지 전송)
+│   │       │   └── OutboxRelayScheduler.kt (Outbox → Kafka 릴레이)
+│   │       └── outbox/
+│   │           └── OutboxEventRepositoryImpl.kt
 │   └── resources/
 │       └── kafka.yml (Kafka 설정)
 └── src/test/
     └── kotlin/com/loopers/
-        ├── domain/
-        │   ├── outbox/OutboxEventTest.kt (도메인 로직 테스트)
-        │   ├── event/EventHandledTest.kt
-        │   └── product/ProductMetricsTest.kt
-        └── infrastructure/kafka/
-            └── KafkaE2EIntegrationTest.kt (E2E 통합 테스트)
+        └── domain/outbox/OutboxEventTest.kt (도메인 로직 테스트)
+```
+
+#### commerce-streamer (Consumer)
+
+```
+apps/commerce-streamer/
+├── build.gradle.kts (Kafka 모듈 이미 포함)
+├── src/main/
+│   ├── kotlin/com/loopers/
+│   │   ├── domain/
+│   │   │   ├── event/
+│   │   │   │   ├── EventHandled.kt (멱등성 보장용 엔티티)
+│   │   │   │   ├── EventHandledRepository.kt
+│   │   │   │   ├── LikeEvent.kt (이벤트 정의)
+│   │   │   │   └── OrderEvent.kt (이벤트 정의)
+│   │   │   └── product/
+│   │   │       ├── ProductMetrics.kt (집계 메트릭 엔티티)
+│   │   │       └── ProductMetricsRepository.kt
+│   │   └── infrastructure/
+│   │       ├── kafka/
+│   │       │   ├── KafkaConfig.kt (토픽 생성 및 설정)
+│   │       │   └── KafkaEventConsumer.kt (Consumer + 멱등 처리)
+│   │       ├── event/
+│   │       │   ├── EventHandledJpaRepository.kt
+│   │       │   └── EventHandledRepositoryImpl.kt
+│   │       └── product/
+│   │           ├── ProductMetricsJpaRepository.kt
+│   │           └── ProductMetricsRepositoryImpl.kt
+│   └── resources/
+│       └── kafka.yml (Kafka Consumer 설정)
 ```
 
 ## Review Points

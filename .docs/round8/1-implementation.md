@@ -5,6 +5,10 @@
 Round 7에서 구현한 ApplicationEvent 기반 이벤트 처리를 Kafka 기반으로 확장하여,
 **서비스 경계를 넘어 이벤트를 안전하게 전달**하는 구조를 구현했습니다.
 
+**애플리케이션 분리:**
+- **commerce-api**: Producer 역할 (Transactional Outbox Pattern)
+- **commerce-streamer**: Consumer 역할 (Idempotent Consumer Pattern)
+
 ## 핵심 패턴
 
 ### 1. Transactional Outbox Pattern
@@ -98,16 +102,18 @@ order-events 토픽
   - Consumer: `enable-auto-commit=false`, `ack-mode=manual`
   - Topics: `catalog-events`, `order-events`, DLQ
 
-#### Producer
+#### Producer (commerce-api)
 - `KafkaProducerService`: Kafka 메시지 전송
 - `OutboxEventPublisher`: Outbox 테이블에 이벤트 저장
 - `OutboxRelayScheduler`: Outbox → Kafka 릴레이 (5초마다)
 
-#### Consumer
+#### Consumer (commerce-streamer)
 - `KafkaEventConsumer`: Kafka 메시지 소비 및 처리
   - `catalog-events` 리스너
   - `order-events` 리스너
   - 멱등성 체크 및 집계 처리
+- `EventHandled`: 이벤트 처리 기록 (멱등성 보장)
+- `ProductMetrics`: 상품 메트릭 집계
 
 ## 메시지 전달 보장
 
@@ -190,8 +196,14 @@ export KAFKA_BOOTSTRAP_SERVERS=localhost:19092
 
 ### 3. 애플리케이션 실행
 
+**Producer (commerce-api):**
 ```bash
 ./gradlew :apps:commerce-api:bootRun
+```
+
+**Consumer (commerce-streamer):**
+```bash
+./gradlew :apps:commerce-streamer:bootRun
 ```
 
 ### 4. 동작 확인
@@ -246,6 +258,8 @@ SELECT * FROM product_metrics WHERE product_id = 100;
 
 ## 주요 파일 위치
 
+### commerce-api (Producer)
+
 ```
 apps/commerce-api/src/main/kotlin/com/loopers/
 ├── domain/
@@ -253,23 +267,42 @@ apps/commerce-api/src/main/kotlin/com/loopers/
 │   │   ├── OutboxEvent.kt
 │   │   ├── OutboxEventRepository.kt
 │   │   └── OutboxEventPublisher.kt
+│   └── event/
+│       ├── LikeEvent.kt (LikeAddedEvent, LikeRemovedEvent)
+│       └── OrderEvent.kt (OrderCreatedEvent)
+├── infrastructure/
+│   ├── kafka/
+│   │   ├── KafkaConfig.kt
+│   │   ├── KafkaProducerService.kt
+│   │   └── OutboxRelayScheduler.kt
+│   └── outbox/
+│       └── OutboxEventRepositoryImpl.kt
+└── resources/
+    └── kafka.yml
+```
+
+### commerce-streamer (Consumer)
+
+```
+apps/commerce-streamer/src/main/kotlin/com/loopers/
+├── domain/
 │   ├── event/
 │   │   ├── EventHandled.kt
-│   │   └── EventHandledRepository.kt
+│   │   ├── EventHandledRepository.kt
+│   │   ├── LikeEvent.kt (LikeAddedEvent, LikeRemovedEvent)
+│   │   └── OrderEvent.kt (OrderCreatedEvent)
 │   └── product/
 │       ├── ProductMetrics.kt
 │       └── ProductMetricsRepository.kt
 ├── infrastructure/
 │   ├── kafka/
 │   │   ├── KafkaConfig.kt
-│   │   ├── KafkaProducerService.kt
-│   │   ├── KafkaEventConsumer.kt
-│   │   └── OutboxRelayScheduler.kt
-│   ├── outbox/
-│   │   └── OutboxEventRepositoryImpl.kt
+│   │   └── KafkaEventConsumer.kt
 │   ├── event/
+│   │   ├── EventHandledJpaRepository.kt
 │   │   └── EventHandledRepositoryImpl.kt
 │   └── product/
+│       ├── ProductMetricsJpaRepository.kt
 │       └── ProductMetricsRepositoryImpl.kt
 └── resources/
     └── kafka.yml
