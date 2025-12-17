@@ -103,14 +103,15 @@ order-events 토픽
   - Topics: `catalog-events`, `order-events`, DLQ
 
 #### Producer (commerce-api)
-- `KafkaProducerService`: Kafka 메시지 전송
+- `KafkaProducerService`: Kafka 메시지 전송 (eventType 헤더 포함)
 - `OutboxEventPublisher`: Outbox 테이블에 이벤트 저장
+- `OutboxEventProcessor`: 개별 Outbox 이벤트를 Kafka로 전송
 - `OutboxRelayScheduler`: Outbox → Kafka 릴레이 (5초마다)
 
 #### Consumer (commerce-streamer)
 - `KafkaEventConsumer`: Kafka 메시지 소비 및 처리
-  - `catalog-events` 리스너
-  - `order-events` 리스너
+  - `catalog-events` 리스너 (eventType 헤더로 이벤트 라우팅)
+  - `order-events` 리스너 (eventType 헤더로 이벤트 라우팅)
   - 멱등성 체크 및 집계 처리
 - `EventHandled`: 이벤트 처리 기록 (멱등성 보장)
 - `ProductMetrics`: 상품 메트릭 집계
@@ -272,10 +273,12 @@ apps/commerce-api/src/main/kotlin/com/loopers/
 │       └── OrderEvent.kt (OrderCreatedEvent)
 ├── infrastructure/
 │   ├── kafka/
-│   │   ├── KafkaConfig.kt
+│   │   ├── KafkaTopicConfig.kt
 │   │   ├── KafkaProducerService.kt
+│   │   ├── OutboxEventProcessor.kt
 │   │   └── OutboxRelayScheduler.kt
 │   └── outbox/
+│       ├── OutboxEventJpaRepository.kt
 │       └── OutboxEventRepositoryImpl.kt
 └── resources/
     └── kafka.yml
@@ -290,13 +293,13 @@ apps/commerce-streamer/src/main/kotlin/com/loopers/
 │   │   ├── EventHandled.kt
 │   │   ├── EventHandledRepository.kt
 │   │   ├── LikeEvent.kt (LikeAddedEvent, LikeRemovedEvent)
-│   │   └── OrderEvent.kt (OrderCreatedEvent)
+│   │   └── OrderCreatedEvent.kt
 │   └── product/
 │       ├── ProductMetrics.kt
 │       └── ProductMetricsRepository.kt
 ├── infrastructure/
 │   ├── kafka/
-│   │   ├── KafkaConfig.kt
+│   │   ├── KafkaTopicConfig.kt
 │   │   └── KafkaEventConsumer.kt
 │   ├── event/
 │   │   ├── EventHandledJpaRepository.kt

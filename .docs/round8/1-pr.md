@@ -12,6 +12,7 @@ Round 7에서 구현한 ApplicationEvent 기반 이벤트 처리를 Kafka로 확
 
 **1. Transactional Outbox Pattern (Producer 측 At Least Once 보장)**
 - commerce-api에서 도메인 데이터 변경과 이벤트 저장을 하나의 트랜잭션으로 처리
+- 이벤트 핸들러(LikeEventHandler, OrderEventHandler)에서 OutboxEventPublisher 호출
 - OutboxRelayScheduler가 주기적으로 PENDING 이벤트를 Kafka로 발행
 - 실패 시 재시도 로직으로 메시지 유실 방지
 
@@ -22,6 +23,7 @@ Round 7에서 구현한 ApplicationEvent 기반 이벤트 처리를 Kafka로 확
 
 **3. Product Metrics 실시간 집계**
 - commerce-streamer에서 좋아요, 조회, 판매량 등을 이벤트 기반으로 집계
+- eventType 헤더로 이벤트 타입 판별 및 라우팅
 - 도메인 로직과 집계 로직 완전 분리 (별도 애플리케이션)
 - 집계 실패해도 도메인 로직에 영향 없음
 
@@ -40,14 +42,19 @@ apps/commerce-api/
 │   │   │   │   ├── OutboxEventRepository.kt
 │   │   │   │   └── OutboxEventPublisher.kt (트랜잭션 내 이벤트 저장)
 │   │   │   └── event/
+│   │   │       ├── handler/
+│   │   │       │   ├── LikeEventHandler.kt (OutboxEventPublisher 통합)
+│   │   │       │   └── OrderEventHandler.kt (OutboxEventPublisher 통합)
 │   │   │       ├── LikeEvent.kt (이벤트 정의)
 │   │   │       └── OrderEvent.kt (이벤트 정의)
 │   │   └── infrastructure/
 │   │       ├── kafka/
-│   │       │   ├── KafkaConfig.kt (토픽 생성 및 설정)
-│   │       │   ├── KafkaProducerService.kt (Kafka 메시지 전송)
+│   │       │   ├── KafkaTopicConfig.kt (토픽 생성 및 설정)
+│   │       │   ├── KafkaProducerService.kt (Kafka 메시지 전송 + eventType 헤더)
+│   │       │   ├── OutboxEventProcessor.kt (Outbox 이벤트 처리)
 │   │       │   └── OutboxRelayScheduler.kt (Outbox → Kafka 릴레이)
 │   │       └── outbox/
+│   │           ├── OutboxEventJpaRepository.kt
 │   │           └── OutboxEventRepositoryImpl.kt
 │   └── resources/
 │       └── kafka.yml (Kafka 설정)
@@ -68,14 +75,14 @@ apps/commerce-streamer/
 │   │   │   │   ├── EventHandled.kt (멱등성 보장용 엔티티)
 │   │   │   │   ├── EventHandledRepository.kt
 │   │   │   │   ├── LikeEvent.kt (이벤트 정의)
-│   │   │   │   └── OrderEvent.kt (이벤트 정의)
+│   │   │   │   └── OrderCreatedEvent.kt (이벤트 정의)
 │   │   │   └── product/
 │   │   │       ├── ProductMetrics.kt (집계 메트릭 엔티티)
 │   │   │       └── ProductMetricsRepository.kt
 │   │   └── infrastructure/
 │   │       ├── kafka/
-│   │       │   ├── KafkaConfig.kt (토픽 생성 및 설정)
-│   │       │   └── KafkaEventConsumer.kt (Consumer + 멱등 처리)
+│   │       │   ├── KafkaTopicConfig.kt (토픽 생성 및 설정)
+│   │       │   └── KafkaEventConsumer.kt (Consumer + eventType 라우팅 + 멱등 처리)
 │   │       ├── event/
 │   │       │   ├── EventHandledJpaRepository.kt
 │   │       │   └── EventHandledRepositoryImpl.kt
@@ -285,7 +292,56 @@ fun consumeCatalogEvents(..., acknowledgment: Acknowledgment) {
 4. ✅ 모두 성공 후에만 Ack
 ```
 
-### 5. Outbox Relay 배치 크기
+### 5. eventType 헤더를 통한 이벤트 라우팅
+
+Consumer가 여러 종류의 이벤트를 처리할 때, 이벤트 타입을 어떻게 판별할까요?
+
+**방법 1: Payload 파싱 (비효율적)**
+```kotlin
+@KafkaListener(topics = ["catalog-events"])
+fun consume(message: String) {
+    val json = objectMapper.readTree(message)
+    // ❌ 매번 JSON 파싱 후 타입 판별
+    if (json.has("likeId")) {
+        handleLikeAdded(...)
+    } else if (json.has("unlikeId")) {
+        handleLikeRemoved(...)
+    }
+}
+```
+
+**방법 2: eventType 헤더 (효율적) ✅**
+```kotlin
+// Producer: 메시지 전송 시 헤더에 eventType 추가
+val record = ProducerRecord<String, String>(topic, null, key, message)
+record.headers().add(RecordHeader("eventType", "LikeAddedEvent".toByteArray()))
+
+// Consumer: 헤더에서 eventType 읽어서 라우팅
+@KafkaListener(topics = ["catalog-events"])
+fun consume(
+    @Payload message: String,
+    @Header("eventType") eventType: String,
+) {
+    when (eventType) {
+        "LikeAddedEvent" -> handleLikeAdded(message)
+        "LikeRemovedEvent" -> handleLikeRemoved(message)
+        else -> logger.warn("알 수 없는 이벤트: $eventType")
+    }
+}
+```
+
+**eventType 헤더의 장점:**
+- JSON 파싱 없이 빠른 라우팅
+- 타입 안전성 보장
+- 로깅 및 모니터링에 유용
+- Kafka UI에서 메시지 필터링 가능
+
+**구현 위치:**
+- `KafkaProducerService.send()`: eventType을 헤더로 추가
+- `OutboxEventProcessor`: OutboxEvent.eventType을 전달
+- `KafkaEventConsumer`: 헤더에서 eventType 읽어 when 분기
+
+### 6. Outbox Relay 배치 크기
 
 ```yaml
 kafka:
@@ -310,7 +366,7 @@ kafka:
 → 예상 처리량: 10개/초 = 36,000개/시간
 ```
 
-### 6. DLQ (Dead Letter Queue) 준비
+### 7. DLQ (Dead Letter Queue) 준비
 
 현재는 DLQ 토픽만 생성하고 실제 전송 로직은 TODO로 남겨두었습니다.
 
@@ -341,11 +397,13 @@ fun consumeCatalogEvents(...) {
 
 ### Producer
 - [x] 도메인 이벤트 설계 (LikeAddedEvent, OrderCreatedEvent 등)
-- [x] Producer에서 도메인 이벤트 발행 (OutboxEventPublisher)
+- [x] 이벤트 핸들러에서 OutboxEventPublisher 통합 (LikeEventHandler, OrderEventHandler)
+- [x] eventType 헤더 추가 (KafkaProducerService)
 - [x] PartitionKey 기반 이벤트 순서 보장 (productId, orderId)
 - [x] 메시지 발행 실패 시 재시도 로직 (OutboxRelayScheduler)
 
 ### Consumer
+- [x] eventType 헤더로 이벤트 라우팅 (KafkaEventConsumer)
 - [x] Consumer가 Metrics 집계 처리 (ProductMetrics)
 - [x] event_handled 테이블을 통한 멱등 처리 구현
 - [ ] 재고 소진 시 상품 캐시 갱신 (TODO)
