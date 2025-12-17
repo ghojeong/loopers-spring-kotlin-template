@@ -855,68 +855,222 @@ sequenceDiagram
 
 - 5분마다 PENDING 상태 결제를 확인하고 동기화하는 흐름
 
+## 9. 좋아요 추가 - Outbox 패턴 (Round 8)
+
+- 좋아요 추가 시 이벤트를 Outbox 테이블에 저장하는 흐름
+- Transactional Outbox Pattern 적용
+
 ```mermaid
 sequenceDiagram
-    participant Scheduler
-    participant PaymentService
-    participant PaymentRepository
-    participant PgClient
-    participant Payment
+    participant User
+    participant LikeV1Controller
+    participant LikeFacade
+    participant LikeService
+    participant LikeRepository
+    participant OutboxEventPublisher
+    participant OutboxEventRepository
 
-    Note over Scheduler: [Infrastructure]<br/>@Scheduled(fixedDelay = 300000)
+    User->>LikeV1Controller: POST /products/{productId}/likes
+    Note over LikeV1Controller: [Interfaces Layer]<br/>X-USER-ID 헤더로 사용자 식별
 
-    Scheduler->>PaymentService: checkPendingPayments()
-    Note over PaymentService: [Domain Service]
+    LikeV1Controller->>LikeFacade: addLike(userId, productId)
+    Note over LikeFacade: [Application Layer]<br/>@Transactional
 
-    PaymentService->>PaymentRepository: findPendingPaymentsOlderThan(minutes = 10)
-    Note over PaymentRepository: SELECT * FROM payments<br/>WHERE status = 'PENDING'<br/>AND created_at < NOW() - 10 minutes
+    LikeFacade->>LikeService: addLike(userId, productId)
+    Note over LikeService: [Domain Service]<br/>멱등성 보장
 
-    PaymentRepository-->>PaymentService: List<Payment> (PENDING, > 10분)
+    LikeService->>LikeRepository: existsByUserIdAndProductId(userId, productId)
+    alt 이미 좋아요 존재
+        LikeRepository-->>LikeService: true
+        Note over LikeService: 멱등성: 중복 저장 없음
+        LikeService-->>LikeFacade: 성공 (중복 처리 안 함)
+    else 좋아요 미존재
+        LikeRepository-->>LikeService: false
 
-    loop 각 PENDING 결제
-        alt transactionKey 존재
-            PaymentService->>PgClient: getTransaction(transactionKey)
-            Note over PgClient: [Infrastructure - Feign]<br/>PG 상태 조회 API 호출
+        Note over LikeService: Like Entity 생성
+        LikeService->>LikeRepository: save(Like)
+        LikeRepository-->>LikeService: Like
 
-            alt PG 조회 성공
-                PgClient-->>PaymentService: PgTransactionResponse (status)
+        Note over LikeService: === Outbox 이벤트 저장 ===
+        LikeService->>OutboxEventPublisher: publish(LikeAddedEvent)
+        Note over OutboxEventPublisher: [Domain Service]<br/>Outbox 테이블에 이벤트 저장
 
-                alt PG 상태: SUCCESS
-                    PaymentService->>Payment: complete()
-                    Note over Payment: status = COMPLETED
-                else PG 상태: FAILED
-                    PaymentService->>Payment: fail(reason)
-                    Note over Payment: status = FAILED
-                else PG 상태: PENDING
-                    Note over PaymentService: 계속 대기 (상태 유지)
-                end
+        OutboxEventPublisher->>OutboxEventRepository: save(OutboxEvent)
+        Note over OutboxEventRepository: [Domain Interface]<br/>OutboxEvent.create(...)<br/>- topic: catalog-events<br/>- partitionKey: productId<br/>- status: PENDING
+        OutboxEventRepository-->>OutboxEventPublisher: OutboxEvent (PENDING)
 
-                PaymentService->>PaymentRepository: save(payment)
-            else PG 조회 실패
-                PgClient-->>PaymentService: Exception
+        OutboxEventPublisher-->>LikeService: 성공
 
-                PaymentService->>Payment: timeout()
-                Note over Payment: status = TIMEOUT
-                PaymentService->>PaymentRepository: save(payment)
-            end
-        else transactionKey 없음
-            PaymentService->>Payment: timeout()
-            Note over Payment: status = TIMEOUT<br/>(PG 요청 자체가 실패한 경우)
-            PaymentService->>PaymentRepository: save(payment)
-        end
+        LikeService-->>LikeFacade: 성공
     end
 
-    PaymentService-->>Scheduler: 완료
+    Note over LikeFacade: === 트랜잭션 커밋 ===<br/>Like + OutboxEvent 동시 저장
+
+    LikeFacade-->>LikeV1Controller: 성공
+    LikeV1Controller-->>User: 200 OK
+
+    Note over OutboxEventRepository: === 별도 스케줄러 (5초마다) ===<br/>OutboxRelayScheduler가<br/>PENDING 이벤트를 Kafka로 발행
 ```
 
 - **레이어별 책임**
-  - `PaymentStatusScheduler (Infrastructure)`: 5분마다 스케줄 실행
-  - `PaymentService (Domain Service)`: PENDING 결제 확인 및 상태 동기화
-  - `PgClient (Infrastructure)`: PG 상태 조회 API 호출
-  - `Payment (Domain Entity)`: 상태 전이 메서드 (`complete()`, `fail()`, `timeout()`)
-  - `PaymentRepository (Domain Interface)`: PENDING 결제 조회 및 저장
+  - `LikeV1Controller (Interfaces)`: HTTP 요청 처리
+  - `LikeFacade (Application)`: 유스케이스 흐름 조율, 트랜잭션 경계
+  - `LikeService (Domain Service)`: 좋아요 로직, 멱등성 보장
+  - `OutboxEventPublisher (Domain Service)`: Outbox 이벤트 발행
+  - `OutboxEvent (Entity)`: Outbox 이벤트 엔티티
+  - `LikeRepository, OutboxEventRepository (Domain Interface)`: Repository 인터페이스
 - **설계 포인트**
-  - **Callback 유실 대비**: 스케줄러를 통해 능동적으로 상태 확인
-  - **10분 기준**: 생성된 지 10분 이상 PENDING 상태인 결제만 확인
-  - **TIMEOUT 처리**: PG 조회 실패 시 TIMEOUT 상태로 전이
-  - **멱등성**: 이미 처리된 결제는 상태 변경 없음
+  - **Transactional Outbox Pattern**: Like 저장과 OutboxEvent 저장을 하나의 트랜잭션으로 처리
+  - **At Least Once 보장**: 트랜잭션 커밋 성공 시 OutboxEvent는 반드시 저장됨
+  - **비동기 발행**: OutboxRelayScheduler가 별도로 Kafka로 발행
+  - **순서 보장**: partitionKey로 같은 상품의 이벤트는 같은 파티션으로 전송
+
+## 10. Outbox Relay - Kafka 발행 (Round 8)
+
+- OutboxRelayScheduler가 PENDING 이벤트를 Kafka로 발행하는 흐름
+
+```mermaid
+sequenceDiagram
+    participant Scheduler as OutboxRelayScheduler
+    participant Processor as OutboxEventProcessor
+    participant OutboxRepo as OutboxEventRepository
+    participant KafkaProducer as KafkaProducerService
+    participant Kafka
+
+    Note over Scheduler: [Infrastructure]<br/>@Scheduled(fixedDelay = 5000)<br/>5초마다 실행
+
+    Scheduler->>OutboxRepo: findPendingEvents(batchSize = 100)
+    Note over OutboxRepo: SELECT * FROM outbox_events<br/>WHERE status = 'PENDING'<br/>ORDER BY created_at<br/>LIMIT 100
+    OutboxRepo-->>Scheduler: List<OutboxEvent> (PENDING)
+
+    loop 각 PENDING 이벤트
+        Scheduler->>Processor: process(outboxEvent)
+        Note over Processor: [Domain Service]<br/>개별 이벤트 처리
+
+        Processor->>KafkaProducer: send(topic, partitionKey, payload, eventType)
+        Note over KafkaProducer: [Infrastructure]<br/>eventType 헤더 추가
+
+        KafkaProducer->>Kafka: ProducerRecord.send()
+        Note over Kafka: acks=all<br/>idempotence=true
+
+        alt Kafka 전송 성공
+            Kafka-->>KafkaProducer: Metadata (offset, partition)
+            KafkaProducer-->>Processor: 성공
+
+            Note over Processor: OutboxEvent.markAsPublished()
+            Processor->>OutboxRepo: save(outboxEvent)
+            Note over OutboxRepo: status = PUBLISHED<br/>published_at = NOW()
+            OutboxRepo-->>Processor: OutboxEvent (PUBLISHED)
+
+        else Kafka 전송 실패
+            Kafka-->>KafkaProducer: Exception
+            KafkaProducer-->>Processor: 실패
+
+            Note over Processor: OutboxEvent.markAsFailed(...)<br/>retry_count++
+            Processor->>OutboxRepo: save(outboxEvent)
+            Note over OutboxRepo: retry_count++<br/>last_attempt_at = NOW()<br/>status = FAILED (max retry 초과 시)
+            OutboxRepo-->>Processor: OutboxEvent (PENDING or FAILED)
+        end
+    end
+
+    Scheduler-->>Scheduler: 5초 대기 후 재실행
+```
+
+- **레이어별 책임**
+  - `OutboxRelayScheduler (Infrastructure)`: 주기적 실행
+  - `OutboxEventProcessor (Domain Service)`: 개별 이벤트 처리
+  - `KafkaProducerService (Infrastructure)`: Kafka 전송
+  - `OutboxEventRepository (Domain Interface)`: Outbox 이벤트 조회/저장
+- **설계 포인트**
+  - **배치 처리**: 한 번에 100개씩 처리
+  - **재시도 로직**: 실패 시 retry_count 증가, 최대 재시도 횟수 초과 시 FAILED 상태
+  - **At Least Once 보장**: PENDING 상태는 계속 재시도됨
+
+## 11. Kafka Consumer - 이벤트 소비 (Round 8)
+
+- commerce-streamer가 Kafka 이벤트를 소비하여 ProductMetrics를 업데이트하는 흐름
+
+```mermaid
+sequenceDiagram
+    participant Kafka
+    participant Consumer as KafkaEventConsumer
+    participant EventHandledRepo as EventHandledRepository
+    participant MetricsRepo as ProductMetricsRepository
+    participant Metrics as ProductMetrics
+
+    Kafka->>Consumer: catalog-events 메시지 수신
+    Note over Consumer: [Infrastructure]<br/>@KafkaListener<br/>@Header("eventType")
+
+    Consumer->>Consumer: 이벤트 타입 라우팅
+    Note over Consumer: when (eventType) {<br/>  "LikeAddedEvent" → handleLikeAdded()<br/>  "LikeRemovedEvent" → handleLikeRemoved()<br/>}
+
+    Note over Consumer: [Application Layer]<br/>@Transactional
+
+    Consumer->>EventHandledRepo: existsByEventId(eventId)
+    Note over EventHandledRepo: [Domain Interface]<br/>멱등성 체크
+
+    alt 이미 처리된 이벤트
+        EventHandledRepo-->>Consumer: true
+        Note over Consumer: 멱등성: 중복 처리 안 함<br/>바로 Ack
+        Consumer->>Kafka: acknowledgment.acknowledge()
+        Note over Kafka: Manual Ack<br/>Offset 커밋
+    else 새로운 이벤트
+        EventHandledRepo-->>Consumer: false
+
+        Note over Consumer: === 비즈니스 로직 실행 ===
+        Consumer->>MetricsRepo: findByProductIdOrCreate(productId)
+        MetricsRepo-->>Consumer: ProductMetrics
+
+        alt LikeAddedEvent
+            Consumer->>Metrics: incrementLikeCount()
+            Note over Metrics: likeCount++
+        else LikeRemovedEvent
+            Consumer->>Metrics: decrementLikeCount()
+            Note over Metrics: likeCount-- (0 이하 방지)
+        end
+
+        Consumer->>MetricsRepo: save(productMetrics)
+        MetricsRepo-->>Consumer: ProductMetrics (updated)
+
+        Note over Consumer: === EventHandled 저장 ===
+        Consumer->>EventHandledRepo: save(EventHandled.create(...))
+        Note over EventHandledRepo: eventId 저장<br/>(UNIQUE 제약)
+        EventHandledRepo-->>Consumer: EventHandled
+
+        Note over Consumer: === 트랜잭션 커밋 ===<br/>ProductMetrics + EventHandled 동시 저장
+
+        Consumer->>Kafka: acknowledgment.acknowledge()
+        Note over Kafka: Manual Ack<br/>Offset 커밋
+    end
+```
+
+- **레이어별 책임**
+  - `KafkaEventConsumer (Infrastructure)`: Kafka 메시지 수신, 이벤트 타입 라우팅
+  - `EventHandledRepository (Domain Interface)`: 멱등성 체크
+  - `ProductMetricsRepository (Domain Interface)`: 메트릭 조회/저장
+  - `ProductMetrics (Entity)`: 메트릭 증감 로직
+- **설계 포인트**
+  - **Idempotent Consumer Pattern**: EventHandled 테이블로 중복 처리 방지
+  - **At Most Once 보장**: 같은 이벤트는 한 번만 처리
+  - **Manual Ack**: 처리 완료 후에만 Offset 커밋
+  - **eventType 헤더**: JSON 파싱 없이 빠른 라우팅
+  - **트랜잭션**: ProductMetrics 업데이트와 EventHandled 저장을 하나의 트랜잭션으로 처리
+
+## 설계 원칙 정리
+
+### Round 8에서 추가된 이벤트 기반 아키텍처
+
+**Transactional Outbox Pattern (Producer)**
+- commerce-api에서 도메인 데이터 변경과 이벤트 저장을 하나의 트랜잭션으로 처리
+- OutboxRelayScheduler가 주기적으로 PENDING 이벤트를 Kafka로 발행
+- At Least Once 보장: 실패 시 재시도 로직으로 메시지 유실 방지
+
+**Idempotent Consumer Pattern (Consumer)**
+- commerce-streamer에서 EventHandled 테이블로 중복 이벤트 처리 방지
+- Manual Ack로 처리 완료 후에만 커밋
+- At Most Once 보장: 같은 이벤트가 여러 번 수신되어도 한 번만 처리
+
+**이벤트 기반 실시간 집계**
+- commerce-streamer에서 ProductMetrics 집계 처리
+- 도메인 로직과 집계 로직 완전 분리 (별도 애플리케이션)
+- 집계 실패해도 도메인 로직에 영향 없음 (장애 격리)

@@ -193,9 +193,65 @@ classDiagram
         MIXED
     }
 
+    class OutboxEvent {
+        <<Entity>>
+        +Long id
+        +String eventType
+        +String topic
+        +String partitionKey
+        +String payload
+        +String aggregateType
+        +Long aggregateId
+        +OutboxEventStatus status
+        +int retryCount
+        +ZonedDateTime lastAttemptAt
+        +String errorMessage
+        +ZonedDateTime publishedAt
+        +markAsPublished() void
+        +markAsFailed(errorMessage, maxRetryCount) void
+        +canRetry(maxRetryCount) boolean
+        +markAsProcessing() void
+        +resetToPending() void
+    }
+
+    class OutboxEventStatus {
+        <<Enumeration>>
+        PENDING
+        PROCESSING
+        PUBLISHED
+        FAILED
+    }
+
+    class EventHandled {
+        <<Entity>>
+        +Long id
+        +String eventId
+        +String eventType
+        +String aggregateType
+        +Long aggregateId
+        +ZonedDateTime handledAt
+        +String handledBy
+    }
+
+    class ProductMetrics {
+        <<Entity>>
+        +Long id
+        +Long productId
+        +Long likeCount
+        +Long viewCount
+        +Long salesCount
+        +Long totalSalesAmount
+        +incrementLikeCount() void
+        +decrementLikeCount() void
+        +incrementViewCount() void
+        +incrementSales(quantity, amount) void
+        +decrementSales(quantity, amount) void
+    }
+
     Brand "1" --> "*" Product : has
     Product "1" --> "1" Price : contains (VO)
     Product "1" --> "1" Stock : has
+    Product "1" --> "1" ProductMetrics : has metrics
     Order "1" *-- "*" OrderItem : aggregates
     OrderItem "1" --> "1" Price : contains (VO)
     OrderItem "1" --> "1" Money : uses (VO)
@@ -207,12 +263,16 @@ classDiagram
     Payment "1" --> "1" Money : contains (VO)
     Payment "1" --> "1" PaymentStatus : has
     Order "1" --> "1" PaymentMethod : has
+    OutboxEvent "1" --> "1" OutboxEventStatus : has
 
     note for Order "Aggregate Root: OrderItem은 Order를 통해서만 접근"
     note for Price "Value Object: 불변, 식별자 없음"
     note for Money "Value Object: 불변, 식별자 없음"
     note for UserCoupon "사용자가 소유한 쿠폰, 1회 사용 제한"
     note for Payment "PG를 통한 카드 결제 정보 관리, 상태 전이 처리"
+    note for OutboxEvent "Transactional Outbox Pattern: 도메인 이벤트를 DB에 저장 (commerce-api)"
+    note for EventHandled "Idempotent Consumer Pattern: 이벤트 중복 처리 방지 (commerce-streamer)"
+    note for ProductMetrics "이벤트 기반 실시간 집계: 상품별 메트릭 관리 (commerce-streamer)"
 ```
 
 ## BaseEntity (모든 엔티티의 기본 클래스)
@@ -553,6 +613,94 @@ abstract class BaseEntity(
   - **타임아웃 처리**: 스케줄러가 10분 이상 PENDING 상태인 결제를 확인하여 TIMEOUT 처리
   - **Resilience 패턴 적용**: PG 호출 시 Timeout, Retry, Circuit Breaker, Fallback 적용
 
+### 14. OutboxEvent (Outbox 이벤트)
+
+**애플리케이션**: commerce-api
+
+- **책임**
+  - Transactional Outbox Pattern 구현
+  - 도메인 이벤트를 DB에 저장
+  - Kafka 발행을 위한 이벤트 큐
+- **속성**
+  - `id`: Outbox 이벤트 고유 식별자
+  - `eventType`: 이벤트 타입 (e.g. LikeAddedEvent, OrderCreatedEvent)
+  - `topic`: Kafka 토픽명 (catalog-events, order-events)
+  - `partitionKey`: 파티션 키 (순서 보장용: productId, orderId)
+  - `payload`: 이벤트 페이로드 (JSON)
+  - `aggregateType`: 집계 타입 (Product, Order, Like)
+  - `aggregateId`: 집계 ID
+  - `status`: 이벤트 상태 (OutboxEventStatus enum)
+  - `retryCount`: 재시도 횟수
+  - `lastAttemptAt`: 마지막 시도 시각
+  - `errorMessage`: 에러 메시지
+  - `publishedAt`: 발행 완료 시각
+- **메서드**
+  - `markAsPublished()`: 발행 성공 처리 (PUBLISHED 상태로 전이)
+  - `markAsFailed(errorMessage, maxRetryCount)`: 발행 실패 처리 (재시도 횟수 초과 시 FAILED 상태)
+  - `canRetry(maxRetryCount)`: 재시도 가능 여부 확인
+  - `markAsProcessing()`: 처리 중 상태로 변경
+  - `resetToPending()`: PENDING 상태로 복원
+- **설계 포인트**
+  - Entity (식별자 존재)
+  - **Transactional Outbox Pattern**: 도메인 데이터 변경과 이벤트 저장을 하나의 트랜잭션으로 처리
+  - **At Least Once 보장**: PENDING 이벤트를 주기적으로 폴링하여 Kafka로 발행
+  - **순서 보장**: partitionKey로 같은 집계의 이벤트는 같은 파티션으로 전송
+  - **재시도 로직**: 실패 시 retryCount 증가, 최대 재시도 횟수 초과 시 FAILED 상태
+  - **별도 애플리케이션**: commerce-api에서만 사용
+
+### 15. EventHandled (이벤트 처리 기록)
+
+**애플리케이션**: commerce-streamer
+
+- **책임**
+  - Idempotent Consumer Pattern 구현
+  - 이벤트 중복 처리 방지
+  - 이벤트 처리 이력 관리
+- **속성**
+  - `id`: 처리 기록 고유 식별자
+  - `eventId`: 이벤트 고유 ID (UUID)
+  - `eventType`: 이벤트 타입 (e.g. LikeAddedEvent)
+  - `aggregateType`: 집계 타입 (Product, Order)
+  - `aggregateId`: 집계 ID
+  - `handledAt`: 처리 완료 시각
+  - `handledBy`: 처리자 (consumer group id: commerce-streamer)
+- **설계 포인트**
+  - Entity (식별자 존재)
+  - **Idempotent Consumer Pattern**: 같은 이벤트를 여러 번 수신해도 한 번만 처리
+  - **At Most Once 보장**: eventId UNIQUE 제약으로 중복 처리 방지
+  - **빠른 중복 체크**: eventId 유니크 인덱스로 O(1) 조회
+  - **장기 보관**: 멱등성 보장을 위해 장기 보관 (아카이빙 정책 필요)
+  - **별도 애플리케이션**: commerce-streamer에서만 사용
+
+### 16. ProductMetrics (상품 메트릭)
+
+**애플리케이션**: commerce-streamer
+
+- **책임**
+  - 상품별 실시간 집계 메트릭 관리
+  - 이벤트 기반 집계 처리
+- **속성**
+  - `id`: 메트릭 고유 식별자
+  - `productId`: 상품 ID
+  - `likeCount`: 좋아요 수
+  - `viewCount`: 조회 수 (상세 페이지)
+  - `salesCount`: 판매량 (주문 완료 기준)
+  - `totalSalesAmount`: 총 판매 금액
+- **메서드**
+  - `incrementLikeCount()`: 좋아요 수 증가
+  - `decrementLikeCount()`: 좋아요 수 감소
+  - `incrementViewCount()`: 조회 수 증가
+  - `incrementSales(quantity, amount)`: 판매량 및 판매 금액 증가
+  - `decrementSales(quantity, amount)`: 판매량 및 판매 금액 감소 (주문 취소 시)
+- **설계 포인트**
+  - Entity (식별자 존재)
+  - Product와 1:1 관계
+  - **이벤트 기반 실시간 집계**: Consumer가 이벤트 수신 시 메트릭 업데이트
+  - **도메인 로직 분리**: commerce-api의 도메인 로직과 집계 로직 완전 분리
+  - **장애 격리**: 집계 실패해도 도메인 로직에 영향 없음
+  - **확장 가능**: 추가 메트릭(평점, 리뷰 수 등) 쉽게 추가 가능
+  - **별도 애플리케이션**: commerce-streamer에서만 사용
+
 ## Enum 정의
 
 ### Gender (성별)
@@ -613,6 +761,17 @@ enum class PaymentMethod {
     POINT,   // 포인트 결제 (동기 처리)
     CARD,    // 카드 결제 (비동기 PG 처리)
     MIXED    // 혼합 결제 (향후 구현 예정)
+}
+```
+
+### OutboxEventStatus (Outbox 이벤트 상태)
+
+```kotlin
+enum class OutboxEventStatus {
+    PENDING,      // 발행 대기 중
+    PROCESSING,   // 처리 중
+    PUBLISHED,    // 발행 완료
+    FAILED        // 발행 실패 (최대 재시도 횟수 초과)
 }
 ```
 

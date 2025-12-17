@@ -151,6 +151,49 @@ erDiagram
         timestamp deleted_at
     }
 
+    outbox_events {
+        bigint id PK
+        varchar event_type
+        varchar topic
+        varchar partition_key
+        text payload
+        varchar aggregate_type
+        bigint aggregate_id
+        varchar status
+        int retry_count
+        timestamp last_attempt_at
+        varchar error_message
+        timestamp published_at
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
+    event_handled {
+        bigint id PK
+        varchar event_id UK
+        varchar event_type
+        varchar aggregate_type
+        bigint aggregate_id
+        timestamp handled_at
+        varchar handled_by
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
+    product_metrics {
+        bigint id PK
+        bigint product_id UK
+        bigint like_count
+        bigint view_count
+        bigint sales_count
+        bigint total_sales_amount
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
     users ||--o{ likes : "has"
     products ||--o{ likes : "receives"
     brands ||--o{ products : "has"
@@ -163,6 +206,7 @@ erDiagram
     coupons ||--o{ user_coupons : "issued to"
     users ||--o{ payments : "makes"
     orders ||--|| payments : "has"
+    products ||--|| product_metrics : "has metrics"
 ```
 
 ## 테이블 상세 설명
@@ -497,6 +541,121 @@ PG를 통한 카드 결제 정보를 저장
   - 복합 인덱스 `(status, created_at)`로 타임아웃 대상 결제 조회 최적화
   - 카드 번호는 마스킹 처리하여 저장 (예: 1234-****-****-5678)
   - 사용자 또는 주문 삭제 시 결제 삭제 방지 (RESTRICT) - 이력 보존
+  - 소프트 삭제 지원 (`deleted_at`)
+
+### 12. outbox_events (Outbox 이벤트)
+
+**도메인 모델 매핑**: `OutboxEvent` Entity (commerce-api)
+
+**애플리케이션**: commerce-api
+
+Transactional Outbox Pattern을 위한 이벤트 저장소
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | Outbox 이벤트 고유 식별자 |
+| event_type | VARCHAR(100) | NOT NULL | 이벤트 타입 (e.g. LikeAddedEvent, OrderCreatedEvent) |
+| topic | VARCHAR(100) | NOT NULL | Kafka 토픽명 (catalog-events, order-events) |
+| partition_key | VARCHAR(100) | NOT NULL | 파티션 키 (순서 보장용: productId, orderId) |
+| payload | TEXT | NOT NULL | 이벤트 페이로드 (JSON) |
+| aggregate_type | VARCHAR(50) | NOT NULL | 집계 타입 (Product, Order, Like) |
+| aggregate_id | BIGINT | NOT NULL | 집계 ID |
+| status | VARCHAR(20) | NOT NULL, DEFAULT 'PENDING' | 이벤트 상태 (PENDING, PROCESSING, PUBLISHED, FAILED) |
+| retry_count | INT | NOT NULL, DEFAULT 0 | 재시도 횟수 |
+| last_attempt_at | TIMESTAMP | NULL | 마지막 시도 시각 |
+| error_message | VARCHAR(1000) | NULL | 에러 메시지 |
+| published_at | TIMESTAMP | NULL | 발행 완료 시각 |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - INDEX: `idx_outbox_status_created` (status, created_at) - 순차 처리용
+  - INDEX: `idx_outbox_aggregate` (aggregate_type, aggregate_id) - 집계별 조회
+- **제약조건**
+  - CHECK: `status IN ('PENDING', 'PROCESSING', 'PUBLISHED', 'FAILED')`
+  - CHECK: `retry_count >= 0`
+- **설계 포인트**
+  - **Transactional Outbox Pattern**: 도메인 데이터 변경과 이벤트 저장을 하나의 트랜잭션으로 처리
+  - **At Least Once 보장**: PENDING 이벤트를 주기적으로 폴링하여 Kafka로 발행
+  - **순서 보장**: partition_key로 같은 집계의 이벤트는 같은 파티션으로 전송
+  - **재시도 로직**: 실패 시 retry_count 증가, 최대 재시도 횟수 초과 시 FAILED 상태
+  - **복합 인덱스 최적화**: (status, created_at)로 PENDING 이벤트 빠른 조회
+  - **별도 애플리케이션**: commerce-api에서만 사용
+  - 소프트 삭제 지원 (`deleted_at`)
+
+### 13. event_handled (이벤트 처리 기록)
+
+**도메인 모델 매핑**: `EventHandled` Entity (commerce-streamer)
+
+**애플리케이션**: commerce-streamer
+
+멱등성 보장을 위한 이벤트 처리 기록
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 처리 기록 고유 식별자 |
+| event_id | VARCHAR(36) | NOT NULL, UNIQUE | 이벤트 고유 ID (UUID) |
+| event_type | VARCHAR(100) | NOT NULL | 이벤트 타입 (e.g. LikeAddedEvent) |
+| aggregate_type | VARCHAR(50) | NOT NULL | 집계 타입 (Product, Order) |
+| aggregate_id | BIGINT | NOT NULL | 집계 ID |
+| handled_at | TIMESTAMP | NOT NULL | 처리 완료 시각 |
+| handled_by | VARCHAR(100) | NOT NULL | 처리자 (consumer group id: commerce-streamer) |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - UNIQUE KEY: `uk_event_handled_event_id` (event_id) - 중복 처리 방지
+  - INDEX: `idx_event_handled_created` (created_at) - 이력 조회
+  - INDEX: `idx_event_handled_aggregate` (event_type, aggregate_type, aggregate_id) - 집계별 조회
+- **설계 포인트**
+  - **Idempotent Consumer Pattern**: 같은 이벤트를 여러 번 수신해도 한 번만 처리
+  - **At Most Once 보장**: event_id UNIQUE 제약으로 중복 처리 방지
+  - **빠른 중복 체크**: event_id 유니크 인덱스로 O(1) 조회
+  - **장기 보관**: 멱등성 보장을 위해 장기 보관 (아카이빙 정책 필요)
+  - **별도 애플리케이션**: commerce-streamer에서만 사용
+  - 소프트 삭제 지원 (`deleted_at`)
+
+### 14. product_metrics (상품 메트릭)
+
+**도메인 모델 매핑**: `ProductMetrics` Entity (commerce-streamer)
+
+**애플리케이션**: commerce-streamer
+
+상품별 실시간 집계 메트릭
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 메트릭 고유 식별자 |
+| product_id | BIGINT | NOT NULL, UNIQUE | 상품 ID |
+| like_count | BIGINT | NOT NULL, DEFAULT 0 | 좋아요 수 |
+| view_count | BIGINT | NOT NULL, DEFAULT 0 | 조회 수 (상세 페이지) |
+| sales_count | BIGINT | NOT NULL, DEFAULT 0 | 판매량 (주문 완료 기준) |
+| total_sales_amount | BIGINT | NOT NULL, DEFAULT 0 | 총 판매 금액 |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - UNIQUE KEY: `uk_product_metrics_product_id` (product_id) - 상품당 1개 메트릭
+  - INDEX: `idx_product_metrics_like_count` (like_count DESC) - 좋아요순 정렬
+  - INDEX: `idx_product_metrics_view_count` (view_count DESC) - 조회순 정렬
+  - INDEX: `idx_product_metrics_sales_count` (sales_count DESC) - 판매순 정렬
+- **제약조건**
+  - CHECK: `like_count >= 0`
+  - CHECK: `view_count >= 0`
+  - CHECK: `sales_count >= 0`
+  - CHECK: `total_sales_amount >= 0`
+- **설계 포인트**
+  - **이벤트 기반 실시간 집계**: Consumer가 이벤트 수신 시 메트릭 업데이트
+  - **도메인 로직 분리**: commerce-api의 도메인 로직과 집계 로직 완전 분리
+  - **장애 격리**: 집계 실패해도 도메인 로직에 영향 없음
+  - **확장 가능**: 추가 메트릭(평점, 리뷰 수 등) 쉽게 추가 가능
+  - **별도 애플리케이션**: commerce-streamer에서만 사용
   - 소프트 삭제 지원 (`deleted_at`)
 
 ## 관계 정리
