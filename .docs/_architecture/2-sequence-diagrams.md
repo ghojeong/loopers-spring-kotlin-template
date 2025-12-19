@@ -1002,7 +1002,7 @@ sequenceDiagram
     Note over Consumer: [Infrastructure]<br/>@KafkaListener<br/>@Header("eventType")
 
     Consumer->>Consumer: 이벤트 타입 라우팅
-    Note over Consumer: when (eventType) {<br/>  "LikeAddedEvent" → handleLikeAdded()<br/>  "LikeRemovedEvent" → handleLikeRemoved()<br/>}
+    Note over Consumer: when (eventType) {<br/>  "LikeAddedEvent" → handleLikeAdded()<br/>  "LikeRemovedEvent" → handleLikeRemoved()<br/>  "StockDepletedEvent" → handleStockDepleted()<br/>}
 
     Note over Consumer: [Application Layer]<br/>@Transactional
 
@@ -1055,6 +1055,86 @@ sequenceDiagram
   - **Manual Ack**: 처리 완료 후에만 Offset 커밋
   - **eventType 헤더**: JSON 파싱 없이 빠른 라우팅
   - **트랜잭션**: ProductMetrics 업데이트와 EventHandled 저장을 하나의 트랜잭션으로 처리
+
+## 12. 재고 소진 - 캐시 갱신 (Round 8)
+
+- 재고 소진 시 이벤트 발행 및 상품 캐시 갱신 흐름
+- Transactional Outbox Pattern 적용
+
+```mermaid
+sequenceDiagram
+    participant OrderFacade
+    participant StockService
+    participant Stock
+    participant StockRepository
+    participant EventPublisher as ApplicationEventPublisher
+    participant StockEventHandler
+    participant ProductCacheRepo as ProductCacheRepository
+    participant OutboxPublisher as OutboxEventPublisher
+    participant OutboxRepo as OutboxEventRepository
+
+    OrderFacade->>StockService: decreaseStock(productId, quantity)
+    Note over StockService: [Domain Service]<br/>@Transactional
+
+    StockService->>StockRepository: findByProductIdWithLock(productId)
+    Note over StockRepository: SELECT FOR UPDATE
+    StockRepository-->>StockService: Stock
+
+    Note over StockService: previousQuantity = stock.quantity
+    StockService->>Stock: decrease(quantity)
+    Note over Stock: [Domain Entity]<br/>재고 차감 로직
+    Stock-->>StockService: 차감 완료
+
+    StockService->>StockRepository: save(stock)
+    StockRepository-->>StockService: Stock (updated)
+
+    alt 재고가 소진된 경우 (quantity == 0)
+        StockService->>EventPublisher: publishEvent(StockDepletedEvent)
+        Note over EventPublisher: [Spring ApplicationEvent]<br/>비동기 이벤트 발행
+    end
+
+    StockService-->>OrderFacade: Stock (updated)
+
+    Note over EventPublisher,OutboxRepo: === 트랜잭션 커밋 후 비동기 처리 ===
+
+    EventPublisher->>StockEventHandler: handleStockDepleted(event)
+    Note over StockEventHandler: [Event Handler]<br/>@Async<br/>@TransactionalEventListener<br/>(AFTER_COMMIT)
+
+    Note over StockEventHandler: === 캐시 무효화 ===
+    StockEventHandler->>ProductCacheRepo: delete(detailCacheKey)
+    Note over ProductCacheRepo: 상품 상세 캐시 삭제
+    ProductCacheRepo-->>StockEventHandler: 삭제 완료
+
+    StockEventHandler->>ProductCacheRepo: deleteByPattern(listCachePattern)
+    Note over ProductCacheRepo: 상품 목록 캐시 삭제<br/>(SCAN 방식)
+    ProductCacheRepo-->>StockEventHandler: 삭제 완료
+
+    Note over StockEventHandler: === Outbox 이벤트 저장 ===
+    StockEventHandler->>OutboxPublisher: publish(StockDepletedEvent)
+    Note over OutboxPublisher: [Domain Service]<br/>@Transactional
+
+    OutboxPublisher->>OutboxRepo: save(OutboxEvent)
+    Note over OutboxRepo: topic: catalog-events<br/>partitionKey: productId<br/>status: PENDING
+    OutboxRepo-->>OutboxPublisher: OutboxEvent
+
+    OutboxPublisher-->>StockEventHandler: 저장 완료
+    StockEventHandler-->>EventPublisher: 처리 완료
+
+    Note over OutboxRepo: === 별도 스케줄러 ===<br/>OutboxRelayScheduler가<br/>PENDING 이벤트를 Kafka로 발행
+```
+
+- **레이어별 책임**
+  - `StockService (Domain Service)`: 재고 차감 및 이벤트 발행
+  - `Stock (Domain Entity)`: 재고 차감 로직 (`decrease()`)
+  - `StockEventHandler (Event Handler)`: 캐시 무효화 및 Outbox 저장
+  - `ProductCacheRepository (Domain Interface)`: Redis 캐시 관리
+  - `OutboxEventPublisher (Domain Service)`: Outbox 테이블에 이벤트 저장
+- **설계 포인트**
+  - **이벤트 기반 캐시 무효화**: 재고 차감 로직과 캐시 관리 완전 분리
+  - **비동기 처리**: `@Async` + `@TransactionalEventListener(AFTER_COMMIT)`
+  - **장애 격리**: 캐시 무효화 실패해도 재고 차감에 영향 없음
+  - **Transactional Outbox Pattern**: Kafka 발행 실패 시에도 재시도 보장
+  - **At Least Once 보장**: OutboxRelayScheduler가 PENDING 이벤트 계속 재시도
 
 ## 설계 원칙 정리
 

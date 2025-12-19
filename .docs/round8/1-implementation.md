@@ -67,6 +67,29 @@ order-events 토픽
 **구현 파일:**
 - `ProductMetrics.kt`: 상품별 집계 메트릭 엔티티
 
+### 4. 재고 소진 시 캐시 갱신
+
+**이벤트 기반 캐시 무효화**
+
+```
+재고 차감 (StockService)
+├── quantity == 0 → StockDepletedEvent 발행
+└── StockEventHandler (비동기)
+    ├── 상품 상세 캐시 삭제
+    ├── 상품 목록 캐시 삭제
+    └── Outbox 테이블에 이벤트 저장 (Kafka 발행용)
+```
+
+**구현 파일:**
+- `StockEvent.kt`: 재고 소진 이벤트
+- `StockEventHandler.kt`: 캐시 무효화 및 Outbox 저장
+- `ProductCacheRepository.kt`: Redis 캐시 관리
+
+**설계 포인트:**
+- 재고 차감 로직과 캐시 관리 완전 분리
+- 비동기 처리로 장애 격리 (캐시 실패해도 재고 차감 성공)
+- Transactional Outbox Pattern으로 Kafka 발행 보장
+
 ## 구현된 컴포넌트
 
 ### 1. Domain Layer
@@ -158,6 +181,7 @@ listener:
 - **이벤트:**
   - `LikeAddedEvent`: 좋아요 추가
   - `LikeRemovedEvent`: 좋아요 제거
+  - `StockDepletedEvent`: 재고 소진
   - `ProductViewEvent`: 상품 조회 (TODO)
 
 ### order-events
@@ -246,6 +270,7 @@ SELECT * FROM product_metrics WHERE product_id = 100;
 - ✅ Product Metrics 집계
 - ✅ Manual Ack 처리
 - ✅ Partition Key 기반 순서 보장
+- ✅ 재고 소진 시 캐시 갱신
 
 ### TODO
 - ⬜ DLQ 처리 로직
@@ -254,7 +279,6 @@ SELECT * FROM product_metrics WHERE product_id = 100;
 - ⬜ Consumer Retry 정책
 - ⬜ 상품 조회 이벤트 집계
 - ⬜ 주문 취소 시 판매량 감소
-- ⬜ 재고 소진 시 캐시 갱신
 - ⬜ 통합 테스트 (Testcontainers Kafka)
 
 ## 주요 파일 위치
@@ -268,9 +292,16 @@ apps/commerce-api/src/main/kotlin/com/loopers/
 │   │   ├── OutboxEvent.kt
 │   │   ├── OutboxEventRepository.kt
 │   │   └── OutboxEventPublisher.kt
-│   └── event/
-│       ├── LikeEvent.kt (LikeAddedEvent, LikeRemovedEvent)
-│       └── OrderEvent.kt (OrderCreatedEvent)
+│   ├── event/
+│   │   ├── LikeEvent.kt (LikeAddedEvent, LikeRemovedEvent)
+│   │   ├── OrderEvent.kt (OrderCreatedEvent)
+│   │   ├── StockEvent.kt (StockDepletedEvent, StockLowEvent)
+│   │   └── handler/
+│   │       ├── LikeEventHandler.kt
+│   │       └── StockEventHandler.kt
+│   └── product/
+│       ├── StockService.kt (재고 차감 및 이벤트 발행)
+│       └── ProductCacheRepository.kt
 ├── infrastructure/
 │   ├── kafka/
 │   │   ├── KafkaTopicConfig.kt
@@ -293,6 +324,7 @@ apps/commerce-streamer/src/main/kotlin/com/loopers/
 │   │   ├── EventHandled.kt
 │   │   ├── EventHandledRepository.kt
 │   │   ├── LikeEvent.kt (LikeAddedEvent, LikeRemovedEvent)
+│   │   ├── StockEvent.kt (StockDepletedEvent, StockLowEvent)
 │   │   └── OrderCreatedEvent.kt
 │   └── product/
 │       ├── ProductMetrics.kt
@@ -300,7 +332,7 @@ apps/commerce-streamer/src/main/kotlin/com/loopers/
 ├── infrastructure/
 │   ├── kafka/
 │   │   ├── KafkaTopicConfig.kt
-│   │   └── KafkaEventConsumer.kt
+│   │   └── KafkaEventConsumer.kt (StockDepletedEvent 처리 추가)
 │   ├── event/
 │   │   ├── EventHandledJpaRepository.kt
 │   │   └── EventHandledRepositoryImpl.kt
