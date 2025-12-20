@@ -138,8 +138,23 @@ fun handleLikeAdded(event: LikeAddedEvent) {
 |------|------|------|
 | **서버 목록 관리** | 어떤 서버들이 있는지 알아야 함 | 서버 추가/제거 시 설정 변경 필요 |
 | **네트워크 장애** | HTTP 요청 실패 시 재시도? | 복잡한 재시도 로직 필요 |
-| **순서 보장** | 동시 요청 시 순서 뒤바뀜 | 데이터 불일치 가능 |
+| **순서 보장 어려움** | 네트워크 지연, 재시도로 전송 순서 != 도착 순서 | 같은 상품에 좋아요 추가→취소 순서가 뒤바뀔 수 있음 |
 | **중복 처리** | 재시도 시 같은 메시지 중복 수신 | 멱등성 처리 필요 |
+
+**순서 보장 문제 예시:**
+
+```
+[Server A에서 발생]
+1. 좋아요 추가 (productId=100) → HTTP 전송 시작 (네트워크 지연 500ms)
+2. 좋아요 취소 (productId=100) → HTTP 전송 시작 (네트워크 지연 100ms)
+
+[Server B에서 수신]
+1. 좋아요 취소 먼저 도착 ❌
+2. 좋아요 추가 나중에 도착 ❌
+
+→ 실제: 취소 상태
+→ 결과: 추가 상태 (잘못됨!)
+```
 
 **"이건 너무 복잡하다... 전문적인 메시지 브로커가 필요해"**
 
@@ -208,19 +223,52 @@ class LikeService(
 
 **시나리오 1: Kafka가 느려지면?**
 
+**잘못된 구현 (트랜잭션 안에서 Kafka 호출):**
+
+```kotlin
+@Transactional  // ❌ 문제: Kafka 호출까지 트랜잭션에 포함
+fun addLike(userId: Long, productId: Long) {
+    likeRepository.save(like)         // 50ms
+    kafkaTemplate.send(...)           // 1000ms ⚠️ 느림!
+    // 트랜잭션 커밋은 Kafka 응답 후에야 가능
+}
+```
+
+**문제점:**
+
 ```
 [트랜잭션 시작]
   ├── Like 저장 (50ms)
   ├── Kafka 전송 (1000ms) ⚠️ 느림!
+  │   - 네트워크 왕복
+  │   - Kafka 브로커 응답 대기
+  │   - 트랜잭션은 계속 유지됨!
   └── 커밋 (10ms)
 
 총 소요 시간: ~1060ms
+→ DB 커넥션을 1060ms 동안 점유!
 ```
 
-**문제:**
+**영향:**
 - Kafka가 느리면 **트랜잭션도 길어짐**
-- DB 커넥션 점유 시간 증가
-- 동시 요청 처리량 감소
+- DB 커넥션 점유 시간 증가 (1초 이상)
+- 커넥션 풀 고갈 → 다른 요청 대기
+- 동시 요청 처리량 급감
+
+**"그럼 트랜잭션을 나누면 되지 않나?"**
+
+```kotlin
+// 시도: 트랜잭션 분리
+@Transactional
+fun addLike(userId: Long, productId: Long) {
+    likeRepository.save(like)  // ✅ 빠른 커밋
+}
+// 트랜잭션 종료
+
+kafkaTemplate.send(...)  // Kafka는 별도로 전송
+```
+
+**하지만 새로운 문제 발생 → 시나리오 3으로 이어짐**
 
 **시나리오 2: Kafka 전송 실패 시?**
 
@@ -239,16 +287,34 @@ fun addLike(userId: Long, productId: Long) {
 - Like도 저장 안 됨
 - Kafka 장애가 도메인 로직에 직접 영향
 
-**시나리오 3: DB 커밋 후 Kafka 실패?**
+**시나리오 3: DB 커밋 후 Kafka 실패? (트랜잭션 분리 시)**
+
+**트랜잭션을 나눈 경우:**
+
+```kotlin
+@Transactional
+fun addLike(userId: Long, productId: Long) {
+    likeRepository.save(like)
+    // 여기서 트랜잭션 커밋 ✅
+}
+
+// 트랜잭션 밖에서 Kafka 전송
+kafkaTemplate.send(...)  // ❌ 실패 가능!
+```
+
+**문제:**
 
 ```
 1. Like 저장 성공
 2. DB 커밋 ✅
-3. Kafka 전송 시도
-4. ❌ Kafka 전송 실패 (네트워크 오류)
+3. (트랜잭션 종료)
+4. Kafka 전송 시도
+5. ❌ Kafka 전송 실패 (네트워크 오류, Kafka 다운 등)
 
 결과: Like는 저장됐는데, 이벤트는 미발행 😱
 ```
+
+**"트랜잭션 안에 넣어도 문제, 빼도 문제... 어떻게 하지?"**
 
 **"DB와 Kafka를 하나의 트랜잭션으로 묶을 수 없잖아..."**
 
