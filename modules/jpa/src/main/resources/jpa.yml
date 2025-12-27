@@ -10,6 +10,10 @@ spring:
         default_batch_fetch_size: 100
         timezone.default_storage: NORMALIZE_UTC
         jdbc.time_zone: UTC
+  batch:
+    jdbc:
+      initialize-schema: never  # prod default
+      table-prefix: BATCH_
 
 datasource:
   mysql-jpa:
@@ -38,6 +42,9 @@ spring:
     show-sql: true
     hibernate:
       ddl-auto: create
+  batch:
+    jdbc:
+      initialize-schema: always  # local: auto-create batch tables
 
 datasource:
   mysql-jpa:
@@ -54,6 +61,9 @@ spring:
     show-sql: true
     hibernate:
       ddl-auto: create
+  batch:
+    jdbc:
+      initialize-schema: always  # test: auto-create batch tables
 
 datasource:
   mysql-jpa:
