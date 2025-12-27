@@ -194,6 +194,46 @@ erDiagram
         timestamp deleted_at
     }
 
+    product_rank_daily {
+        bigint id PK
+        date ranking_date
+        bigint product_id
+        double score
+        int rank
+        bigint like_count
+        bigint view_count
+        bigint sales_count
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
+    mv_product_rank_weekly {
+        bigint id PK
+        varchar year_week UK
+        bigint product_id
+        double score
+        int rank
+        date period_start
+        date period_end
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
+    mv_product_rank_monthly {
+        bigint id PK
+        varchar year_month UK
+        bigint product_id
+        double score
+        int rank
+        date period_start
+        date period_end
+        timestamp created_at
+        timestamp updated_at
+        timestamp deleted_at
+    }
+
     users ||--o{ likes : "has"
     products ||--o{ likes : "receives"
     brands ||--o{ products : "has"
@@ -207,6 +247,9 @@ erDiagram
     users ||--o{ payments : "makes"
     orders ||--|| payments : "has"
     products ||--|| product_metrics : "has metrics"
+    products ||--o{ product_rank_daily : "has daily rank"
+    products ||--o{ mv_product_rank_weekly : "has weekly rank"
+    products ||--o{ mv_product_rank_monthly : "has monthly rank"
 ```
 
 ## 테이블 상세 설명
@@ -656,6 +699,127 @@ Transactional Outbox Pattern을 위한 이벤트 저장소
   - **장애 격리**: 집계 실패해도 도메인 로직에 영향 없음
   - **확장 가능**: 추가 메트릭(평점, 리뷰 수 등) 쉽게 추가 가능
   - **별도 애플리케이션**: commerce-streamer에서만 사용
+  - 소프트 삭제 지원 (`deleted_at`)
+
+### 15. product_rank_daily (일간 랭킹 영구 저장)
+
+**도메인 모델 매핑**: `ProductRankDaily` Entity (commerce-streamer)
+
+**애플리케이션**: commerce-streamer, commerce-api
+
+일간 랭킹을 DB에 영구 저장 (매일 23:55에 Redis → DB)
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 랭킹 고유 식별자 |
+| ranking_date | DATE | NOT NULL | 랭킹 날짜 (해당 일자의 랭킹) |
+| product_id | BIGINT | NOT NULL | 상품 ID |
+| score | DOUBLE | NOT NULL | 랭킹 점수 |
+| rank | INT | NOT NULL | 순위 (1부터 시작) |
+| like_count | BIGINT | NOT NULL, DEFAULT 0 | 좋아요 수 (스냅샷) |
+| view_count | BIGINT | NOT NULL, DEFAULT 0 | 조회 수 (스냅샷) |
+| sales_count | BIGINT | NOT NULL, DEFAULT 0 | 판매량 (스냅샷) |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - UNIQUE KEY: `uk_product_rank_daily_date_product` (ranking_date, product_id)
+  - INDEX: `idx_product_rank_daily_date` (ranking_date DESC) - 날짜별 랭킹 조회
+  - INDEX: `idx_product_rank_daily_date_rank` (ranking_date, rank) - 날짜별 순위 조회
+  - INDEX: `idx_product_rank_daily_product_id` (product_id) - 상품별 랭킹 이력 조회
+- **제약조건**
+  - CHECK: `rank > 0` (순위는 1 이상)
+  - CHECK: `score >= 0` (점수는 0 이상)
+- **설계 포인트**
+  - **Daily Persistence**: 매일 23:55에 DailyRankingPersistenceScheduler가 Redis TOP 1000 → DB 저장
+  - **Batch Aggregation 소스**: 주간/월간 배치 집계의 데이터 소스
+  - **멱등성**: (ranking_date, product_id) 복합 유니크 키로 중복 방지
+  - **스냅샷**: 해당 시점의 메트릭 정보(좋아요, 조회, 판매) 함께 저장
+  - **별도 애플리케이션**: commerce-streamer에서 저장, commerce-api에서 조회
+  - 소프트 삭제 지원 (`deleted_at`)
+
+### 16. mv_product_rank_weekly (주간 랭킹 집계 - Materialized View)
+
+**도메인 모델 매핑**: `ProductRankWeekly` Entity (commerce-streamer)
+
+**애플리케이션**: commerce-streamer, commerce-api
+
+주간 TOP 100 랭킹 집계 (매주 일요일 01:00에 배치 집계)
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 랭킹 고유 식별자 |
+| year_week | VARCHAR(7) | NOT NULL | 연도-주차 (yyyy'W'ww, 예: 2025W01) |
+| product_id | BIGINT | NOT NULL | 상품 ID |
+| score | DOUBLE | NOT NULL | 집계 점수 (주간 평균) |
+| rank | INT | NOT NULL | 주간 순위 (1부터 시작, TOP 100) |
+| period_start | DATE | NOT NULL | 집계 시작일 (주의 월요일) |
+| period_end | DATE | NOT NULL | 집계 종료일 (주의 일요일) |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - UNIQUE KEY: `uk_product_rank_weekly_year_week_product` (year_week, product_id)
+  - INDEX: `idx_product_rank_weekly_year_week` (year_week DESC) - 주차별 랭킹 조회
+  - INDEX: `idx_product_rank_weekly_year_week_rank` (year_week, rank) - 주차별 순위 조회
+- **제약조건**
+  - CHECK: `rank > 0 AND rank <= 100` (TOP 100만 저장)
+  - CHECK: `score >= 0`
+- **설계 포인트**
+  - **Materialized View**: 사전 계산된 집계 데이터 저장 (쿼리 성능 최적화)
+  - **Spring Batch Job**: WeeklyRankingAggregationJob (매주 일요일 01:00)
+  - **Chunk-Oriented Processing**: Reader → Processor → Writer (chunk size: 100)
+  - **Reader**: product_rank_daily에서 지난 7일 데이터 읽기 → 상품별 평균 점수 계산 → TOP 100 선정
+  - **Processor**: 집계 데이터를 ProductRankWeekly 엔티티로 변환
+  - **Writer**: 기존 데이터 삭제 후 신규 데이터 저장 (멱등성 보장)
+  - **저장 전략**: TOP 100만 저장 (스토리지 효율)
+  - **집계 방식**: 평균 점수 (결측일에 대한 공정성)
+  - **별도 애플리케이션**: commerce-streamer에서 집계, commerce-api에서 조회
+  - 소프트 삭제 지원 (`deleted_at`)
+
+### 17. mv_product_rank_monthly (월간 랭킹 집계 - Materialized View)
+
+**도메인 모델 매핑**: `ProductRankMonthly` Entity (commerce-streamer)
+
+**애플리케이션**: commerce-streamer, commerce-api
+
+월간 TOP 100 랭킹 집계 (매월 1일 02:00에 배치 집계)
+
+| 컬럼명 | 타입 | 제약조건 | 설명 |
+| --- | --- | --- | --- |
+| id | BIGINT | PK, AUTO_INCREMENT | 랭킹 고유 식별자 |
+| year_month | VARCHAR(6) | NOT NULL | 연도-월 (yyyyMM, 예: 202501) |
+| product_id | BIGINT | NOT NULL | 상품 ID |
+| score | DOUBLE | NOT NULL | 집계 점수 (월간 평균) |
+| rank | INT | NOT NULL | 월간 순위 (1부터 시작, TOP 100) |
+| period_start | DATE | NOT NULL | 집계 시작일 (월의 1일) |
+| period_end | DATE | NOT NULL | 집계 종료일 (월의 마지막일) |
+| created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
+| updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
+| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
+
+- **인덱스**
+  - PRIMARY KEY: `id`
+  - UNIQUE KEY: `uk_product_rank_monthly_year_month_product` (year_month, product_id)
+  - INDEX: `idx_product_rank_monthly_year_month` (year_month DESC) - 월별 랭킹 조회
+  - INDEX: `idx_product_rank_monthly_year_month_rank` (year_month, rank) - 월별 순위 조회
+- **제약조건**
+  - CHECK: `rank > 0 AND rank <= 100` (TOP 100만 저장)
+  - CHECK: `score >= 0`
+- **설계 포인트**
+  - **Materialized View**: 사전 계산된 집계 데이터 저장 (쿼리 성능 최적화)
+  - **Spring Batch Job**: MonthlyRankingAggregationJob (매월 1일 02:00)
+  - **Chunk-Oriented Processing**: Reader → Processor → Writer (chunk size: 100)
+  - **Reader**: product_rank_daily에서 해당 월 데이터 읽기 → 상품별 평균 점수 계산 → TOP 100 선정
+  - **Processor**: 집계 데이터를 ProductRankMonthly 엔티티로 변환
+  - **Writer**: 기존 데이터 삭제 후 신규 데이터 저장 (멱등성 보장)
+  - **저장 전략**: TOP 100만 저장 (스토리지 효율)
+  - **집계 방식**: 평균 점수 (결측일에 대한 공정성)
+  - **별도 애플리케이션**: commerce-streamer에서 집계, commerce-api에서 조회
   - 소프트 삭제 지원 (`deleted_at`)
 
 ## 관계 정리
