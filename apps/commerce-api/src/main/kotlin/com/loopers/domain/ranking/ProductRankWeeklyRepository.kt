@@ -7,4 +7,8 @@ interface ProductRankWeeklyRepository {
         yearWeek: String,
         limit: Int,
     ): List<ProductRankWeekly>
+
+    fun saveAll(ranks: List<ProductRankWeekly>): List<ProductRankWeekly>
+
+    fun deleteByYearWeek(yearWeek: String)
 }

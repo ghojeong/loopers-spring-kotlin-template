@@ -7,4 +7,8 @@ interface ProductRankMonthlyRepository {
         yearMonth: String,
         limit: Int,
     ): List<ProductRankMonthly>
+
+    fun saveAll(ranks: List<ProductRankMonthly>): List<ProductRankMonthly>
+
+    fun deleteByYearMonth(yearMonth: String)
 }

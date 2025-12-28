@@ -19,19 +19,19 @@ import java.time.format.DateTimeFormatter
     uniqueConstraints = [
         UniqueConstraint(
             name = "uk_product_rank_weekly_year_week_product",
-            columnNames = ["year_week", "product_id"],
+            columnNames = ["`year_week`", "product_id"],
         ),
     ],
     indexes = [
-        Index(name = "idx_product_rank_weekly_year_week", columnList = "year_week DESC"),
-        Index(name = "idx_product_rank_weekly_year_week_rank", columnList = "year_week, rank"),
+        Index(name = "idx_product_rank_weekly_year_week", columnList = "`year_week` DESC"),
+        Index(name = "idx_product_rank_weekly_year_week_rank", columnList = "`year_week`, `rank`"),
     ],
 )
 class ProductRankWeekly(
     /**
      * 연도-주차 (yyyy'W'ww, 예: 2025W01)
      */
-    @Column(name = "year_week", nullable = false, length = 7)
+    @Column(name = "`year_week`", nullable = false, length = 7)
     val yearWeek: String,
 
     /**
@@ -49,7 +49,7 @@ class ProductRankWeekly(
     /**
      * 주간 순위 (1부터 시작)
      */
-    @Column(name = "rank", nullable = false)
+    @Column(name = "`rank`", nullable = false)
     var rank: Int,
 
     /**

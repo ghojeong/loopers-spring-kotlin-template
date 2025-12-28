@@ -19,19 +19,19 @@ import java.time.YearMonth
     uniqueConstraints = [
         UniqueConstraint(
             name = "uk_product_rank_monthly_year_month_product",
-            columnNames = ["year_month", "product_id"],
+            columnNames = ["`year_month`", "product_id"],
         ),
     ],
     indexes = [
-        Index(name = "idx_product_rank_monthly_year_month", columnList = "year_month DESC"),
-        Index(name = "idx_product_rank_monthly_year_month_rank", columnList = "year_month, rank"),
+        Index(name = "idx_product_rank_monthly_year_month", columnList = "`year_month` DESC"),
+        Index(name = "idx_product_rank_monthly_year_month_rank", columnList = "`year_month`, `rank`"),
     ],
 )
 class ProductRankMonthly(
     /**
      * 연도-월 (yyyyMM, 예: 202501)
      */
-    @Column(name = "year_month", nullable = false, length = 6)
+    @Column(name = "`year_month`", nullable = false, length = 6)
     val yearMonth: String,
 
     /**
@@ -49,7 +49,7 @@ class ProductRankMonthly(
     /**
      * 월간 순위 (1부터 시작)
      */
-    @Column(name = "rank", nullable = false)
+    @Column(name = "`rank`", nullable = false)
     var rank: Int,
 
     /**
