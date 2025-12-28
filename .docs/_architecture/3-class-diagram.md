@@ -204,9 +204,9 @@ classDiagram
         +Long aggregateId
         +OutboxEventStatus status
         +int retryCount
-        +ZonedDateTime lastAttemptAt
+        +LocalDateTime lastAttemptAt
         +String errorMessage
-        +ZonedDateTime publishedAt
+        +LocalDateTime publishedAt
         +markAsPublished() void
         +markAsFailed(errorMessage, maxRetryCount) void
         +canRetry(maxRetryCount) boolean
@@ -229,7 +229,7 @@ classDiagram
         +String eventType
         +String aggregateType
         +Long aggregateId
-        +ZonedDateTime handledAt
+        +LocalDateTime handledAt
         +String handledBy
     }
 

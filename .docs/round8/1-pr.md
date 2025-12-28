@@ -146,7 +146,7 @@ Consumer는 초당 수백 건의 중복 체크를 해야 하므로, **유니크 
 // Outbox 클린업 (TODO로 남겨둠)
 @Scheduled(cron = "0 0 2 * * *") // 매일 새벽 2시
 fun cleanupPublishedEvents() {
-    val threshold = ZonedDateTime.now().minusDays(7)
+    val threshold = LocalDateTime.now().minusDays(7)
     outboxEventRepository.deletePublishedEventsBefore(threshold)
 }
 ```

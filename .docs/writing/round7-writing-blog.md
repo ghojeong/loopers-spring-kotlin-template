@@ -499,7 +499,7 @@ data class OrderCreatedEvent(
     val userId: Long,
     val amount: Long,
     val couponId: Long?,
-    val createdAt: ZonedDateTime,
+    val createdAt: LocalDateTime,
 )
 
 data class PaymentCompletedEvent(

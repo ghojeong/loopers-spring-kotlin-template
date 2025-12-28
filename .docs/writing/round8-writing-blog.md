@@ -832,7 +832,7 @@ CREATE TABLE event_log (
 // PUBLISHED 이벤트는 7일 후 삭제 가능
 @Scheduled(cron = "0 0 3 * * *")
 fun cleanupOldPublishedEvents() {
-    val threshold = ZonedDateTime.now().minusDays(7)
+    val threshold = LocalDateTime.now().minusDays(7)
     outboxEventRepository.deletePublishedEventsBefore(threshold)
 }
 ```
@@ -1244,7 +1244,7 @@ PUBLISHED 이벤트가 계속 쌓인다.
 ```kotlin
 @Scheduled(cron = "0 0 3 * * *")  // 매일 새벽 3시
 fun cleanupPublishedEvents() {
-    val threshold = ZonedDateTime.now().minusDays(7)
+    val threshold = LocalDateTime.now().minusDays(7)
     val deleted = outboxEventRepository
         .deletePublishedEventsBefore(threshold)
 
