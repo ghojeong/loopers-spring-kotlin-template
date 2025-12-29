@@ -298,12 +298,79 @@ classDiagram
         +copyWithWeight(sourceKey, targetKey, weight) void
     }
 
+    class ProductRankDaily {
+        <<Entity>>
+        +Long id
+        +LocalDate rankingDate
+        +Long productId
+        +Double score
+        +Int rank
+        +Long likeCount
+        +Long viewCount
+        +Long salesCount
+    }
+
+    class ProductRankWeekly {
+        <<Entity>>
+        +Long id
+        +String yearWeek
+        +Long productId
+        +Double score
+        +Int rank
+        +LocalDate periodStart
+        +LocalDate periodEnd
+        +yearWeekToString(date) String
+    }
+
+    class ProductRankMonthly {
+        <<Entity>>
+        +Long id
+        +String yearMonth
+        +Long productId
+        +Double score
+        +Int rank
+        +LocalDate periodStart
+        +LocalDate periodEnd
+        +yearMonthToString(yearMonth) String
+        +stringToYearMonth(yearMonth) YearMonth
+    }
+
+    class ProductRankDailyRepository {
+        <<Interface>>
+        +save(entity) ProductRankDaily
+        +saveAll(entities) List~ProductRankDaily~
+        +deleteByRankingDate(date) void
+        +findByRankingDateBetween(start, end) List~ProductRankDaily~
+        +findByRankingDate(date) List~ProductRankDaily~
+    }
+
+    class ProductRankWeeklyRepository {
+        <<Interface>>
+        +save(entity) ProductRankWeekly
+        +saveAll(entities) List~ProductRankWeekly~
+        +deleteByYearWeek(yearWeek) void
+        +findByYearWeek(yearWeek) List~ProductRankWeekly~
+        +findTopByYearWeekOrderByRank(yearWeek, limit) List~ProductRankWeekly~
+    }
+
+    class ProductRankMonthlyRepository {
+        <<Interface>>
+        +save(entity) ProductRankMonthly
+        +saveAll(entities) List~ProductRankMonthly~
+        +deleteByYearMonth(yearMonth) void
+        +findByYearMonth(yearMonth) List~ProductRankMonthly~
+        +findTopByYearMonthOrderByRank(yearMonth, limit) List~ProductRankMonthly~
+    }
+
     Ranking "1" --> "1" RankingScore : contains (VO)
     RankingKey "1" --> "1" RankingScope : has
     RankingKey "1" --> "1" TimeWindow : has
     RankingRepository ..> RankingKey : uses
     RankingRepository ..> Ranking : uses
     RankingRepository ..> RankingScore : uses
+    ProductRankDailyRepository ..> ProductRankDaily : manages
+    ProductRankWeeklyRepository ..> ProductRankWeekly : manages
+    ProductRankMonthlyRepository ..> ProductRankMonthly : manages
 
     Brand "1" --> "*" Product : has
     Product "1" --> "1" Price : contains (VO)
@@ -330,10 +397,13 @@ classDiagram
     note for OutboxEvent "Transactional Outbox Pattern: 도메인 이벤트를 DB에 저장 (commerce-api)"
     note for EventHandled "Idempotent Consumer Pattern: 이벤트 중복 처리 방지 (commerce-streamer)"
     note for ProductMetrics "이벤트 기반 실시간 집계: 상품별 메트릭 관리 (commerce-streamer)"
-    note for Ranking "Redis ZSET 기반 랭킹 정보 (libs/domain-core)"
-    note for RankingKey "시간 양자화를 통한 Redis 키 전략 (libs/domain-core)"
-    note for RankingScore "랭킹 점수 기본 타입 (libs/domain-core)<br/>각 모듈은 RankingScoreCalculator로 확장"
-    note for RankingRepository "랭킹 저장소 인터페이스 (libs/domain-core)<br/>각 모듈에서 RankingRedisRepository로 구현"
+    note for Ranking "Redis ZSET 기반 랭킹 정보 (modules/redis)"
+    note for RankingKey "시간 양자화를 통한 Redis 키 전략 (modules/redis)"
+    note for RankingScore "랭킹 점수 기본 타입 (modules/redis)<br/>각 모듈은 RankingScoreCalculator로 확장"
+    note for RankingRepository "랭킹 저장소 인터페이스 (modules/redis)<br/>RankingRedisRepository로 구현"
+    note for ProductRankDaily "일간 랭킹 스냅샷 (modules/jpa)<br/>매일 23:55에 Redis TOP 1000 저장"
+    note for ProductRankWeekly "주간 랭킹 집계 (modules/jpa)<br/>매주 일요일 01:00에 TOP 100 저장"
+    note for ProductRankMonthly "월간 랭킹 집계 (modules/jpa)<br/>매월 1일 02:00에 TOP 100 저장"
 ```
 
 ## BaseEntity (모든 엔티티의 기본 클래스)
@@ -764,7 +834,7 @@ abstract class BaseEntity(
 
 ### 17. Ranking (랭킹 정보) - **Value Object**
 
-**위치**: libs/domain-core (공유 모듈)
+**위치**: modules/redis (공유 모듈)
 
 - **타입**: Value Object (식별자 없음)
 - **책임**
@@ -784,7 +854,7 @@ abstract class BaseEntity(
 
 ### 18. RankingKey (랭킹 키) - **Value Object**
 
-**위치**: libs/domain-core (공유 모듈)
+**위치**: modules/redis (공유 모듈)
 
 - **타입**: Value Object (식별자 없음)
 - **책임**
@@ -808,7 +878,7 @@ abstract class BaseEntity(
 
 ### 19. RankingScore (랭킹 점수) - **Value Object**
 
-**위치**: libs/domain-core (공유 모듈, 기본 타입)
+**위치**: modules/redis (공유 모듈, 기본 타입)
 
 - **타입**: Value Object (식별자 없음)
 - **책임**
@@ -830,7 +900,7 @@ abstract class BaseEntity(
 
 ### 20. RankingRepository (랭킹 저장소)
 
-**위치**: libs/domain-core (공유 모듈, 인터페이스)
+**위치**: modules/redis (공유 모듈, 인터페이스)
 
 - **책임**
   - Redis ZSET 기반 랭킹 저장소 계약 정의
@@ -846,9 +916,90 @@ abstract class BaseEntity(
   - `copyWithWeight(sourceKey, targetKey, weight)`: 가중치 복사 (콜드 스타트 방지)
 - **설계 포인트**
   - **Repository Interface는 Domain에 위치**: 공유 도메인 계약
-  - **구현체는 각 모듈에 위치**: RankingRedisRepository
+  - **구현체는 modules/redis에 위치**: RankingRedisRepository
   - **Redis ZSET 기반**: 내부적으로 Redis ZSET 명령어 사용
   - **배치 처리 지원**: incrementScoreBatch로 성능 최적화
+
+### 21. ProductRankDaily (일간 랭킹 영구 저장) - **Entity**
+
+**위치**: modules/jpa (공유 엔티티)
+
+- **타입**: Entity (식별자 있음)
+- **책임**
+  - Redis 랭킹 데이터의 일간 스냅샷 저장
+  - 주간/월간 집계의 원본 데이터 제공
+  - 상품별 메트릭 스냅샷 함께 저장
+- **속성**
+  - `id`: 엔티티 ID (Long, PK)
+  - `rankingDate`: 랭킹 날짜 (LocalDate)
+  - `productId`: 상품 ID
+  - `score`: 랭킹 점수 (Double)
+  - `rank`: 순위 (Int, 1부터 시작)
+  - `likeCount`: 좋아요 수 스냅샷
+  - `viewCount`: 조회 수 스냅샷
+  - `salesCount`: 판매량 스냅샷
+- **인덱스**
+  - `uk_product_rank_daily_date_product`: (ranking_date, product_id) UNIQUE
+  - `idx_product_rank_daily_date`: ranking_date DESC
+  - `idx_product_rank_daily_date_rank`: (ranking_date, rank)
+- **설계 포인트**
+  - **Materialized View 역할**: Redis 데이터를 DB에 영구 저장
+  - **TOP 1000만 저장**: 매일 23:55 스케줄러로 TOP 1000 저장
+  - **멱등성**: deleteByRankingDate 후 저장으로 보장
+  - **집계 원본 데이터**: 배치 Job의 ItemReader가 이 테이블 조회
+
+### 22. ProductRankWeekly (주간 랭킹 집계) - **Entity**
+
+**위치**: modules/jpa (공유 엔티티)
+
+- **타입**: Entity (식별자 있음)
+- **책임**
+  - 주간 TOP 100 랭킹 집계 결과 저장
+  - 일간 랭킹(ProductRankDaily)으로부터 주간 평균 계산
+- **속성**
+  - `id`: 엔티티 ID (Long, PK)
+  - `yearWeek`: 연도-주차 (String, "2025W03")
+  - `productId`: 상품 ID
+  - `score`: 주간 평균 점수 (Double)
+  - `rank`: 주간 순위 (Int)
+  - `periodStart`: 집계 시작일 (LocalDate, 월요일)
+  - `periodEnd`: 집계 종료일 (LocalDate, 일요일)
+- **인덱스**
+  - `uk_product_rank_weekly_year_week_product`: (year_week, product_id) UNIQUE
+  - `idx_product_rank_weekly_year_week`: year_week DESC
+  - `idx_product_rank_weekly_year_week_rank`: (year_week, rank)
+- **설계 포인트**
+  - **Materialized View**: 집계 결과를 미리 계산하여 저장
+  - **TOP 100만 저장**: 배치 Job으로 매주 일요일 01:00에 집계
+  - **평균 점수 기준**: 7일간 평균 점수로 순위 산정
+  - **멱등성**: deleteByYearWeek 후 저장으로 보장
+
+### 23. ProductRankMonthly (월간 랭킹 집계) - **Entity**
+
+**위치**: modules/jpa (공유 엔티티)
+
+- **타입**: Entity (식별자 있음)
+- **책임**
+  - 월간 TOP 100 랭킹 집계 결과 저장
+  - 일간 랭킹(ProductRankDaily)으로부터 월간 평균 계산
+- **속성**
+  - `id`: 엔티티 ID (Long, PK)
+  - `yearMonth`: 연도-월 (String, "202501")
+  - `productId`: 상품 ID
+  - `score`: 월간 평균 점수 (Double)
+  - `rank`: 월간 순위 (Int)
+  - `periodStart`: 집계 시작일 (LocalDate, 1일)
+  - `periodEnd`: 집계 종료일 (LocalDate, 말일)
+- **인덱스**
+  - `uk_product_rank_monthly_year_month_product`: (year_month, product_id) UNIQUE
+  - `idx_product_rank_monthly_year_month`: year_month DESC
+  - `idx_product_rank_monthly_year_month_rank`: (year_month, rank)
+- **설계 포인트**
+  - **Materialized View**: 집계 결과를 미리 계산하여 저장
+  - **TOP 100만 저장**: 배치 Job으로 매월 1일 02:00에 집계
+  - **평균 점수 기준**: 한 달간 평균 점수로 순위 산정
+  - **멱등성**: deleteByYearMonth 후 저장으로 보장
+  - **yearMonth 검증**: init 블록에서 yyyyMM 형식 검증
 
 ## Enum 정의
 

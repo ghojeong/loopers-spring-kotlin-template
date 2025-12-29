@@ -367,9 +367,70 @@ jobLauncher.run(weeklyRankingAggregationJob, jobParameters)
   - WEEKLY/MONTHLY: DB 조회
   - TimeWindow enum 확장으로 일관된 API 제공
 
+## 📁 모듈 분리
+
+### commerce-batch 모듈 독립화
+
+Spring Batch 관련 코드를 독립 모듈로 완전 분리하여 관심사 분리 및 독립적 배포 가능
+
+**포함 내역:**
+- Spring Batch Jobs (WeeklyRankingAggregationJob, MonthlyRankingAggregationJob)
+- Batch Schedulers (DailyRankingPersistenceScheduler, RankingBatchScheduler)
+- Batch 전용 도메인 (ProductRankDaily)
+- Repository 구현체 (JPA)
+
+**의존성:**
+- modules/redis (Ranking, RankingKey, RankingScore, RankingRepository, RankingRedisRepository - 공유)
+- modules/jpa (ProductMetrics, ProductRankWeekly, ProductRankMonthly - 공유 엔티티)
+
+**테스트 커버리지:**
+- Unit Tests: 도메인 로직 검증 (ProductRankDaily, ProductRankWeekly, ProductRankMonthly)
+- Integration Tests: Repository 테스트 (ProductRankDailyRepository)
+- Test Utilities: BatchTestDataFactory
+
+### commerce-streamer 모듈 정리
+
+배치 관련 코드 완전 제거, 실시간 이벤트 처리에만 집중
+
+**제거된 내역:**
+- Spring Batch 설정 및 Job (2개)
+- 배치 스케줄러 (2개)
+- 배치 전용 도메인 및 Repository (ProductRankDaily, ProductRankWeekly/Monthly Repository - 7개)
+- build.gradle.kts Spring Batch 의존성
+- RankingRedisRepository (modules/redis로 이동)
+
+**유지된 내역:**
+- RankingScheduler (실시간 랭킹 콜드 스타트 방지)
+- RankingScoreCalculator (점수 계산 로직)
+- Kafka Consumer (이벤트 처리)
+
+### modules/redis 통합
+
+Redis 관련 도메인 및 인프라를 단일 모듈로 통합하여 중복 제거
+
+**포함 내역:**
+- 랭킹 도메인 객체 (Ranking, RankingKey, RankingScore, RankingRepository)
+- RankingRedisRepository 구현체 (commerce-api, commerce-streamer에서 중복 제거)
+- RedisConfig, RedisProperties
+- 테스트: RankingKeyTest, RankingScoreTest, RankingRedisRepositoryIntegrationTest
+
+**변경사항:**
+- libs/domain-core 폐지 → modules/redis로 통합
+- RankingRedisRepository 중복 제거 (commerce-api, commerce-streamer → modules/redis)
+
+**공유 모듈 활용:**
+- ProductMetrics: modules/jpa로 이동하여 commerce-batch와 commerce-streamer가 공유 (중복 제거)
+
+---
+
 ## 📝 주요 설계 결정사항
 
-1. **모듈 선택**: `commerce-streamer` (이미 ranking scheduler 보유)
+1. **모듈 분리 및 통합**:
+   - `apps/commerce-batch`: 배치 전용 모듈로 분리 (Spring Batch Job, Scheduler, ProductRankDaily)
+   - `modules/redis`: Redis 관련 도메인 및 구현체 통합 (Ranking, RankingRedisRepository 중복 제거)
+   - `modules/jpa`: 공유 엔티티 통합 (ProductMetrics, ProductRankWeekly, ProductRankMonthly 중복 제거)
+   - `libs/domain-core` 폐지: Redis 도메인을 modules/redis로 통합
+   - commerce-api, commerce-streamer, commerce-batch가 modules/redis, modules/jpa를 공유
 2. **데이터 소스**: Redis daily ranking → DB 영구 저장 → 주간/월간 집계
 3. **저장 전략**: Materialized View 테이블에 TOP 100만 저장
 4. **집계 방식**: 평균 점수 (결측일에 대한 공정성)
