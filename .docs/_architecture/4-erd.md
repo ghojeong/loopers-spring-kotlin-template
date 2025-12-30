@@ -66,7 +66,6 @@ erDiagram
         int quantity
         timestamp created_at
         timestamp updated_at
-        timestamp deleted_at
     }
 
     likes {
@@ -112,7 +111,6 @@ erDiagram
         varchar currency
         timestamp created_at
         timestamp updated_at
-        timestamp deleted_at
     }
 
     coupons {
@@ -140,12 +138,13 @@ erDiagram
         bigint id PK
         bigint user_id FK
         bigint order_id FK
-        decimal amount
-        varchar currency
+        bigint amount
+        varchar payment_method
         varchar status
         varchar transaction_key UK
         varchar card_type
         varchar card_no
+        varchar failure_reason
         timestamp created_at
         timestamp updated_at
         timestamp deleted_at
@@ -343,7 +342,6 @@ erDiagram
 | quantity | INT | NOT NULL, DEFAULT 0 | 재고 수량 |
 | created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
 | updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
-| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
 
 - **인덱스**
   - PRIMARY KEY: `product_id`
@@ -352,10 +350,15 @@ erDiagram
 - **제약조건**
   - CHECK: `quantity >= 0` (재고는 음수 불가)
 - **설계 포인트**
-  - product_id를 PK로 사용 (1:1 관계)
+  - product_id를 PK로 사용 (Product와 1:1 관계)
+  - **BaseEntity 미상속 (Shared Primary Key 패턴)**
+    - FK(`product_id`)를 PK로 직접 사용하여 BaseEntity의 자동 생성 `id`와 충돌 방지
+    - Product의 부속 데이터로 독립적인 생명주기가 없어 독립 ID 불필요
+    - Product 삭제 시 CASCADE로 함께 삭제되므로 Soft Delete 불필요
+    - PK 인덱스 하나로 충분하여 성능 최적화 (별도 UNIQUE 인덱스 불필요)
+  - **Aggregate 패턴**: Product가 Aggregate Root, Stock이 부속 엔티티
   - 비관적 락(SELECT FOR UPDATE)으로 동시성 제어
-  - 상품 삭제 시 재고도 함께 삭제 (CASCADE)
-  - 소프트 삭제 지원 (`deleted_at`)
+  - 상품 삭제 시 재고도 함께 삭제 (ON DELETE CASCADE)
 
 ### 5. likes (좋아요)
 
@@ -463,7 +466,6 @@ erDiagram
 | currency | VARCHAR(3) | NOT NULL, DEFAULT 'KRW' | 통화 단위 |
 | created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 생성 일시 |
 | updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
-| deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
 
 - **인덱스**
   - PRIMARY KEY: `user_id`
@@ -474,10 +476,15 @@ erDiagram
 - **설계 포인트**
   - **Money VO 매핑**: `balance`, `currency` 컬럼으로 임베드
     - `Money` VO는 별도 테이블이 아닌 Point의 컬럼으로 저장
-  - user_id를 PK로 사용 (1:1 관계)
+  - user_id를 PK로 사용 (User와 1:1 관계)
+  - **BaseEntity 미상속 (Shared Primary Key 패턴)**
+    - FK(`user_id`)를 PK로 직접 사용하여 BaseEntity의 자동 생성 `id`와 충돌 방지
+    - User의 부속 데이터로 독립적인 생명주기가 없어 독립 ID 불필요
+    - User 삭제 시 CASCADE로 함께 삭제되므로 Soft Delete 불필요
+    - PK 인덱스 하나로 충분하여 성능 최적화 (별도 UNIQUE 인덱스 불필요)
+  - **Aggregate 패턴**: User가 Aggregate Root, Point가 부속 엔티티
   - 비관적 락(SELECT FOR UPDATE)으로 동시성 제어
-  - 사용자 삭제 시 포인트도 함께 삭제 (CASCADE)
-  - 소프트 삭제 지원 (`deleted_at`)
+  - 사용자 삭제 시 포인트도 함께 삭제 (ON DELETE CASCADE)
 
 ### 9. coupons (쿠폰)
 
@@ -542,7 +549,7 @@ erDiagram
 
 ### 11. payments (결제)
 
-**도메인 모델 매핑**: `Payment` Entity + `Money` Value Object
+**도메인 모델 매핑**: `Payment` Entity
 
 PG를 통한 카드 결제 정보를 저장
 
@@ -551,12 +558,13 @@ PG를 통한 카드 결제 정보를 저장
 | id | BIGINT | PK, AUTO_INCREMENT | 결제 고유 식별자 |
 | user_id | BIGINT | NOT NULL, FK | 사용자 식별자 |
 | order_id | BIGINT | NOT NULL, FK | 주문 식별자 |
-| amount | DECIMAL(15,2) | NOT NULL | 결제 금액 |
-| currency | VARCHAR(3) | NOT NULL, DEFAULT 'KRW' | 통화 단위 |
-| status | VARCHAR(20) | NOT NULL, DEFAULT 'PENDING' | 결제 상태 (PENDING, COMPLETED, FAILED, TIMEOUT) |
-| transaction_key | VARCHAR(255) | NOT NULL, UNIQUE | PG 거래 고유 키 |
-| card_type | VARCHAR(50) | NOT NULL | 카드 종류 (SAMSUNG, SHINHAN 등) |
-| card_no | VARCHAR(255) | NOT NULL | 카드 번호 (마스킹 처리) |
+| amount | BIGINT | NOT NULL | 결제 금액 (원화 단위, Money VO 미사용) |
+| payment_method | VARCHAR(20) | NOT NULL | 결제 방식 (CARD) |
+| status | VARCHAR(20) | NOT NULL, DEFAULT 'PENDING' | 결제 상태 (PENDING, PROCESSING, COMPLETED, FAILED, TIMEOUT) |
+| transaction_key | VARCHAR(255) | NULL, UNIQUE | PG 거래 고유 키 |
+| card_type | VARCHAR(50) | NULL | 카드 종류 (SAMSUNG, SHINHAN 등) |
+| card_no | VARCHAR(255) | NULL | 카드 번호 (마스킹 처리) |
+| failure_reason | VARCHAR(500) | NULL | 실패 사유 |
 | created_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP | 결제 생성 일시 |
 | updated_at | TIMESTAMP | NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP | 최근 갱신 일시 |
 | deleted_at | TIMESTAMP | NULL | 삭제 일시 (소프트 삭제) |
@@ -564,24 +572,23 @@ PG를 통한 카드 결제 정보를 저장
 - **인덱스**
   - PRIMARY KEY: `id`
   - UNIQUE KEY: `transaction_key` (PG 거래 키 중복 방지, 멱등성 보장)
-  - INDEX: `user_id` (사용자별 결제 조회)
-  - INDEX: `order_id` (주문별 결제 조회)
-  - INDEX: `status, created_at` (상태별, 생성 일시 기준 결제 조회)
+  - INDEX: `idx_user_id` (사용자별 결제 조회)
+  - INDEX: `idx_order_id` (주문별 결제 조회)
+  - INDEX: `idx_status` (상태별 결제 조회)
 - **외래키**
   - `user_id` REFERENCES `users(id)` ON DELETE RESTRICT
   - `order_id` REFERENCES `orders(id)` ON DELETE RESTRICT
 - **제약조건**
   - CHECK: `amount > 0` (결제 금액은 양수)
-  - CHECK: `status IN ('PENDING', 'COMPLETED', 'FAILED', 'TIMEOUT')`
+  - CHECK: `status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'TIMEOUT')`
 - **설계 포인트**
-  - **Money VO 매핑**: `amount`, `currency` 컬럼으로 임베드
-    - `Money` VO는 별도 테이블이 아닌 Payment의 컬럼으로 저장
+  - **amount 타입**: `BIGINT` (원화 단위, Money VO 미사용)
   - Order와 1:1 관계 (한 주문당 하나의 결제)
-  - **비동기 결제 처리**: PENDING → PG 요청 → 콜백 대기 → COMPLETED/FAILED
+  - **비동기 결제 처리**: PENDING → PROCESSING → PG 요청 → 콜백 대기 → COMPLETED/FAILED
   - **멱등성**: `transaction_key`를 UNIQUE로 설정하여 중복 콜백 방지
-  - **상태 전이**: PENDING → COMPLETED/FAILED/TIMEOUT
+  - **상태 전이**: PENDING → PROCESSING → COMPLETED/FAILED/TIMEOUT
   - **타임아웃 처리**: 스케줄러가 10분 이상 PENDING 상태인 결제를 확인하여 TIMEOUT 처리
-  - 복합 인덱스 `(status, created_at)`로 타임아웃 대상 결제 조회 최적화
+  - **실패 이유 저장**: `failure_reason` 컬럼으로 실패 원인 추적
   - 카드 번호는 마스킹 처리하여 저장 (예: 1234-****-****-5678)
   - 사용자 또는 주문 삭제 시 결제 삭제 방지 (RESTRICT) - 이력 보존
   - 소프트 삭제 지원 (`deleted_at`)
@@ -1016,7 +1023,6 @@ CREATE TABLE stocks (
     quantity INT NOT NULL DEFAULT 0 CHECK (quantity >= 0),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP NULL,
     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
 );
 
@@ -1072,7 +1078,6 @@ CREATE TABLE points (
     currency VARCHAR(3) NOT NULL DEFAULT 'KRW',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP NULL,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
@@ -1081,18 +1086,19 @@ CREATE TABLE payments (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     user_id BIGINT NOT NULL,
     order_id BIGINT NOT NULL,
-    amount DECIMAL(15,2) NOT NULL CHECK (amount > 0),
-    currency VARCHAR(3) NOT NULL DEFAULT 'KRW',
-    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'TIMEOUT')),
-    transaction_key VARCHAR(255) NOT NULL UNIQUE,
-    card_type VARCHAR(50) NOT NULL,
-    card_no VARCHAR(255) NOT NULL,
+    amount BIGINT NOT NULL CHECK (amount > 0),
+    payment_method VARCHAR(20) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'TIMEOUT')),
+    transaction_key VARCHAR(255) NULL UNIQUE,
+    card_type VARCHAR(50) NULL,
+    card_no VARCHAR(255) NULL,
+    failure_reason VARCHAR(500) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP NULL,
     INDEX idx_user_id (user_id),
     INDEX idx_order_id (order_id),
-    INDEX idx_status_created_at (status, created_at),
+    INDEX idx_status (status),
     UNIQUE KEY uk_transaction_key (transaction_key),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT,
     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE RESTRICT

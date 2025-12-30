@@ -162,25 +162,29 @@ classDiagram
         +Long id
         +Long userId
         +Long orderId
-        +Money amount
-        +Currency currency
+        +Long amount
+        +PaymentMethod paymentMethod
         +PaymentStatus status
         +String transactionKey
         +String cardType
         +String cardNo
+        +String failureReason
         +LocalDateTime createdAt
         +LocalDateTime updatedAt
         +isCompleted() boolean
         +isFailed() boolean
         +isPending() boolean
+        +isProcessing() boolean
         +complete() void
-        +fail() void
+        +fail(reason) void
         +timeout() void
+        +updateTransactionKey(key) void
     }
 
     class PaymentStatus {
         <<Enumeration>>
         PENDING
+        PROCESSING
         COMPLETED
         FAILED
         TIMEOUT
@@ -384,7 +388,7 @@ classDiagram
     UserCoupon "*" --> "1" Coupon : references
     Coupon "1" --> "1" CouponType : has
     Payment "1" --> "1" Order : references
-    Payment "1" --> "1" Money : contains (VO)
+    Payment "1" --> "1" PaymentMethod : has
     Payment "1" --> "1" PaymentStatus : has
     Order "1" --> "1" PaymentMethod : has
     OutboxEvent "1" --> "1" OutboxEventStatus : has
@@ -406,11 +410,13 @@ classDiagram
     note for ProductRankMonthly "월간 랭킹 집계 (modules/jpa)<br/>매월 1일 02:00에 TOP 100 저장"
 ```
 
-## BaseEntity (모든 엔티티의 기본 클래스)
+## BaseEntity (대부분 엔티티의 기본 클래스)
 
 ### 소프트 삭제 (Soft Delete) 지원
 
-모든 도메인 엔티티는 `BaseEntity`를 상속받아 공통 속성과 기능을 공유합니다.
+대부분의 도메인 엔티티는 `BaseEntity`를 상속받아 공통 속성과 기능을 공유합니다.
+
+**예외: Point와 Stock은 BaseEntity를 상속하지 않습니다** (이유는 아래 도메인 객체 상세 설명 참고)
 
 **BaseEntity 속성:**
 - `id`: 엔티티 고유 식별자 (Long)
@@ -550,15 +556,22 @@ abstract class BaseEntity(
   - 재고 증감 로직
   - 재고 정합성 보장
 - **속성**
-  - `productId`: 상품 식별자
+  - `productId`: 상품 식별자 (PK, FK)
   - `quantity`: 재고 수량
+  - `createdAt`: 생성 일시
+  - `updatedAt`: 최근 갱신 일시
 - **메서드**
   - `decrease(int)`: 재고 감소 (재고 부족 시 예외 발생)
   - `increase(int)`: 재고 증가
   - `isAvailable(int)`: 재고 확인
 - **설계 포인트**
   - Entity (productId로 식별)
-  - Product와 1:1 관계
+  - **BaseEntity 미상속 (Shared Primary Key 패턴)**
+    - **이유 1**: FK(`productId`)를 PK로 직접 사용하므로 BaseEntity의 자동 생성 `id`와 충돌
+    - **이유 2**: Product의 부속 데이터로 독립적인 생명주기가 없어 독립 ID 불필요
+    - **이유 3**: Product 삭제 시 CASCADE로 함께 삭제되므로 Soft Delete 불필요
+    - **이유 4**: PK 인덱스 하나로 충분하여 성능 최적화 (별도 UNIQUE 인덱스 불필요)
+  - Product와 1:1 관계 (Aggregate: Product가 Root, Stock이 부속)
   - **동시성 제어**: 비관적 락(`SELECT FOR UPDATE`) 사용
     - 여러 사용자의 동시 주문 시 재고 정합성 확보
     - `decrease()` 메서드 호출 시 DB 행 잠금
@@ -656,8 +669,9 @@ abstract class BaseEntity(
   - 사용자 포인트 관리
   - 포인트 충전 및 차감
 - **속성**
-  - `userId`: 사용자 식별자
+  - `userId`: 사용자 식별자 (PK, FK)
   - `balance`: 보유 포인트 (Money)
+  - `createdAt`: 생성 일시
   - `updatedAt`: 최근 갱신 일시
 - **메서드**
   - `charge(Money)`: 포인트 충전
@@ -665,7 +679,12 @@ abstract class BaseEntity(
   - `canDeduct(Money)`: 차감 가능 여부 확인
 - **설계 포인트**
   - Entity (userId로 식별)
-  - User와 1:1 관계
+  - **BaseEntity 미상속 (Shared Primary Key 패턴)**
+    - **이유 1**: FK(`userId`)를 PK로 직접 사용하므로 BaseEntity의 자동 생성 `id`와 충돌
+    - **이유 2**: User의 부속 데이터로 독립적인 생명주기가 없어 독립 ID 불필요
+    - **이유 3**: User 삭제 시 CASCADE로 함께 삭제되므로 Soft Delete 불필요
+    - **이유 4**: PK 인덱스 하나로 충분하여 성능 최적화 (별도 UNIQUE 인덱스 불필요)
+  - User와 1:1 관계 (Aggregate: User가 Root, Point가 부속)
   - 동시성 제어 필요 (비관적 락 사용)
 
 ### 11. Coupon (쿠폰)
@@ -720,28 +739,33 @@ abstract class BaseEntity(
   - `id`: 결제 고유 식별자
   - `userId`: 사용자 식별자
   - `orderId`: 주문 식별자
-  - `amount`: 결제 금액 (Money)
-  - `currency`: 통화 (Currency)
+  - `amount`: 결제 금액 (Long, 원화 단위)
+  - `paymentMethod`: 결제 방식 (PaymentMethod: CARD)
   - `status`: 결제 상태 (PaymentStatus)
-  - `transactionKey`: PG 거래 고유 키
-  - `cardType`: 카드 종류 (SAMSUNG, SHINHAN 등)
-  - `cardNo`: 카드 번호 (마스킹 처리)
+  - `transactionKey`: PG 거래 고유 키 (nullable)
+  - `cardType`: 카드 종류 (SAMSUNG, SHINHAN 등, nullable)
+  - `cardNo`: 카드 번호 (마스킹 처리, nullable)
+  - `failureReason`: 실패 사유 (nullable)
   - `createdAt`: 결제 생성 일시
   - `updatedAt`: 결제 수정 일시
 - **메서드**
   - `isCompleted()`: 결제 완료 여부 확인
   - `isFailed()`: 결제 실패 여부 확인
   - `isPending()`: 결제 대기 여부 확인
+  - `isProcessing()`: 결제 처리 중 여부 확인
   - `complete()`: 결제를 COMPLETED 상태로 전이
-  - `fail()`: 결제를 FAILED 상태로 전이
+  - `fail(reason)`: 결제를 FAILED 상태로 전이 (실패 사유 저장)
   - `timeout()`: 결제를 TIMEOUT 상태로 전이
+  - `updateTransactionKey(key)`: PG 거래 키 업데이트
 - **설계 포인트**
   - Entity (id로 식별)
   - Order와 1:1 관계 (한 주문당 하나의 결제)
-  - **비동기 결제 처리**: PENDING → PG 요청 → 콜백 대기 → COMPLETED/FAILED
+  - **amount 타입**: Long (원화 단위, Money VO 미사용)
+  - **비동기 결제 처리**: PENDING → PROCESSING → PG 요청 → 콜백 대기 → COMPLETED/FAILED
   - **멱등성**: 콜백 중복 처리 방지 (transactionKey 기반)
-  - **상태 전이**: PENDING → COMPLETED/FAILED/TIMEOUT
+  - **상태 전이**: PENDING → PROCESSING → COMPLETED/FAILED/TIMEOUT
   - **타임아웃 처리**: 스케줄러가 10분 이상 PENDING 상태인 결제를 확인하여 TIMEOUT 처리
+  - **실패 사유 추적**: failureReason 필드로 실패 원인 저장
   - **Resilience 패턴 적용**: PG 호출 시 Timeout, Retry, Circuit Breaker, Fallback 적용
 
 ### 14. OutboxEvent (Outbox 이벤트)
@@ -1047,7 +1071,8 @@ enum class CouponType {
 
 ```kotlin
 enum class PaymentStatus {
-    PENDING,      // 결제 대기 중 (PG 요청 후 콜백 대기)
+    PENDING,      // 결제 대기 중 (생성 직후)
+    PROCESSING,   // 결제 처리 중 (PG 요청 후 콜백 대기)
     COMPLETED,    // 결제 완료
     FAILED,       // 결제 실패
     TIMEOUT       // 결제 타임아웃 (10분 이상 응답 없음)
