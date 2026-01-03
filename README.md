@@ -9,9 +9,9 @@ TDD, 동시성 제어, 성능 최적화, 이벤트 기반 아키텍처, 분산 �
 ### 비즈니스 도메인
 
 - 상품 조회 및 브랜드별 필터링
-- 좋아요 기능 (찜하기)
-- 포인트 관리 및 충전
 - 주문/결제 (쿠폰 할인 지원)
+- 포인트 관리 및 충전
+- 좋아요 기능
 - 인기 상품 랭킹 시스템
 
 ### 기술 스택
@@ -65,10 +65,10 @@ TDD, 동시성 제어, 성능 최적화, 이벤트 기반 아키텍처, 분산 �
 
 **학습 내용:**
 
-- **요구사항 정의서**
-- **시퀀스 다이어그램**
-- **클래스 다이어그램**
-- **ERD (Entity Relationship Diagram)**
+- [시나리오 및 요구사항](.docs/_architecture/1-requirements.md)
+- [시퀀스 다이어그램](.docs/_architecture/2-sequence-diagrams.md)
+- [클래스 다이어그램](.docs/_architecture/3-class-diagram.md)
+- [ERD (Entity Relationship Diagram)](.docs/_architecture/4-erd.md)
 
 ### Week 3: 도메인 모델링
 
@@ -462,42 +462,30 @@ docker-compose -f ./docker/monitoring-compose.yml up -d
 
 ## 테스트 실행
 
-### 전체 테스트 실행
-
-```bash
-# 모든 모듈의 테스트 실행
-./gradlew test
-
-# 특정 모듈만 실행
-./gradlew :apps:commerce-api:test
-```
-
-### 테스트 실행법
-
-#### 빌드 시 테스트 실행
+### 빌드 후 테스트 실행
 
 ```bash
 # docker compose -f ./docker/infra-compose.yml up 실행 필수
 ./gradlew clean build
 ```
 
-#### 단위 및 통합 테스트
+### API 테스트
 
 ```bash
-# API 테스트 (infra-compose.yml 실행 필수)
+# docker compose -f ./docker/infra-compose.yml up 실행 필수
 ./gradlew :apps:commerce-api:test
 ```
 
-#### Kafka 연동 테스트
+### Kafka Consumer 연동 테스트
 
 ```bash
-# Kafka Consumer 통합 테스트 (infra-compose.yml 실행 필수)
+# docker compose -f ./docker/infra-compose.yml up 실행 필수
 KAFKA_BOOTSTRAP_SERVERS=localhost:19092 ./gradlew :apps:commerce-streamer:test
 ```
 
-#### Batch 테스트
+### Batch 테스트
 
 ```bash
-# Batch 모듈 테스트 (infra-compose.yml 실행 필수)
+# docker compose -f ./docker/infra-compose.yml up 실행 필수
 ./gradlew :apps:commerce-batch:test
 ```
