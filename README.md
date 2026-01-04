@@ -26,7 +26,6 @@ TDD, 동시성 제어, 성능 최적화, 이벤트 기반 아키텍처, 분산 �
 - **직렬화**: Jackson 3.0.3
 - **API 문서**: SpringDoc OpenAPI 3.0.0
 - **결제 연동**: 외부 PG사 연동 (Resilience4j)
-- **모니터링**: Prometheus + Grafana
 - **테스트**: JUnit 5, MockK 5.0.1, Mockito 5.21.0
 
 ---
